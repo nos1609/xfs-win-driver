@@ -639,8 +639,10 @@ mod winfsp_adapter {
     use std::sync::{Arc, Mutex};
     use widestring::U16CStr;
     use windows::Win32::Foundation::{
-        STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST, STATUS_MEDIA_WRITE_PROTECTED,
-        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_BUFFER_TOO_SMALL, STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST,
+        STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY, STATUS_NOT_A_REPARSE_POINT,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_REPARSE_POINT_NOT_RESOLVED,
     };
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
@@ -672,6 +674,29 @@ mod winfsp_adapter {
     /// require an extra feature gate.
     const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
+    /// The target is to be interpreted relative to the directory holding
+    /// the link. WinFsp's resolver also keeps walking a relative target,
+    /// which is what lets a chain of links inside this volume resolve
+    /// without ever naming a drive letter.
+    const SYMLINK_FLAG_RELATIVE: u32 = 1;
+
+    /// Bytes of a symbolic-link reparse buffer ahead of the path data.
+    ///
+    /// Taken from `REPARSE_DATA_BUFFER` as WinFsp itself declares it
+    /// (`inc/winfsp/winfsp.h:56`, because the user-mode SDK headers omit
+    /// it): tag, data length, reserved, then the symlink view's two
+    /// offset/length pairs and a flags word.
+    const REPARSE_SYMLINK_HEADER_BYTES: usize = 20;
+
+    /// `ReparseDataLength` counts from offset 8, so the four `USHORT`
+    /// fields and the `ULONG` flags occupy the 12 bytes before the names.
+    const REPARSE_SYMLINK_FIELD_BYTES: usize = REPARSE_SYMLINK_HEADER_BYTES - 8;
+
+    /// `MAXIMUM_REPARSE_DATA_BUFFER_SIZE`. A link whose Windows spelling
+    /// needs more than this cannot be a reparse point, however valid it
+    /// is as an XFS target.
+    const MAXIMUM_REPARSE_DATA_BUFFER_BYTES: usize = 16 * 1024;
+
     // The Unix-to-FILETIME conversion lives in winfsp-fs-skeleton.
     // This module had the fourth copy of it in the family -- erofs and
     // ext4 had two more, at three different widths between them -- and
@@ -687,6 +712,116 @@ mod winfsp_adapter {
             return Ok("/".into());
         }
         Ok(s.replace('\\', "/"))
+    }
+
+    /// Rewrite an XFS link target as the absolute Windows path a
+    /// symbolic-link reparse buffer carries.
+    ///
+    /// XFS stores targets as POSIX paths, absolute or relative to the
+    /// directory holding the link. The buffer needs one spelling, and
+    /// WinFsp's resolver replaces the *whole* path when the target
+    /// starts with `\` -- so resolving to an absolute-in-volume name is
+    /// what lets a link avoid naming a drive letter at all. A
+    /// `\??\X:`-style target would pin the volume to whichever letter it
+    /// happened to be mounted on.
+    ///
+    /// `..` above the volume root is dropped, which is how the kernel
+    /// treats `..` in a root directory, and keeps a link whose target
+    /// escapes the filesystem from producing a path outside the volume.
+    fn link_target_to_winpath(link_unix: &str, target: &str) -> String {
+        // An absolute target ignores the link's own directory; a
+        // relative one starts from it.
+        let base = match target.strip_prefix('/') {
+            Some(_) => "",
+            None => link_unix.rsplit_once('/').map_or("", |(parent, _)| parent),
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for segment in base.split('/').chain(target.split('/')) {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut out = String::with_capacity(base.len() + target.len() + 1);
+        for part in parts {
+            out.push('\\');
+            out.push_str(part);
+        }
+        // A link that resolves to the volume root still needs a name.
+        if out.is_empty() {
+            out.push('\\');
+        }
+        out
+    }
+
+    /// Serialise a Microsoft symbolic-link reparse buffer.
+    ///
+    /// Offsets are from the start of the buffer. Both strings sit in
+    /// `PathBuffer` back to back, unlengthed and unterminated, so the
+    /// print name starts exactly where the substitute name ends; sizes
+    /// are in bytes, not characters.
+    fn symlink_reparse_buffer(win_target: &str) -> Vec<u8> {
+        let name: Vec<u8> = win_target
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let name_bytes = name.len() as u16;
+        let mut buf = Vec::with_capacity(REPARSE_SYMLINK_HEADER_BYTES + 2 * name.len());
+        buf.extend_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(REPARSE_SYMLINK_FIELD_BYTES + 2 * name.len())
+                .unwrap_or(u16::MAX)
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved / unparsed length
+        buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+        buf.extend_from_slice(&name_bytes.to_le_bytes()); // SubstituteNameLength
+        buf.extend_from_slice(&name_bytes.to_le_bytes()); // PrintNameOffset
+        buf.extend_from_slice(&name_bytes.to_le_bytes()); // PrintNameLength
+        buf.extend_from_slice(&SYMLINK_FLAG_RELATIVE.to_le_bytes());
+        buf.extend_from_slice(&name);
+        buf.extend_from_slice(&name);
+        buf
+    }
+
+    /// Build the reparse buffer for the link at `unix_path` and copy it
+    /// into WinFsp's buffer, returning the byte count written.
+    ///
+    /// `Filesystem::open` deliberately does not follow links, so the path
+    /// resolves to the link's own inode and the target can be read from
+    /// it.
+    fn fill_link_reparse_buffer(
+        fs: &Filesystem,
+        unix_path: &str,
+        buffer: &mut [u8],
+    ) -> FspResult<u64> {
+        let file = fs
+            .open(unix_path)
+            .map_err(|e| err_to_status(e))?;
+        if !file.is_symlink() {
+            return Err(STATUS_NOT_A_REPARSE_POINT.into());
+        }
+        let target = file.link_target().map_err(|e| err_to_status(e))?;
+        let Ok(target) = String::from_utf8(target) else {
+            // Names leave this driver as UTF-8 -- the directory listing
+            // decodes them the same way -- so a target that is not valid
+            // UTF-8 has no spelling here. Refusing is honest; substituting
+            // replacement characters would point the link at some other
+            // file.
+            return Err(STATUS_REPARSE_POINT_NOT_RESOLVED.into());
+        };
+        let data = symlink_reparse_buffer(&link_target_to_winpath(unix_path, &target));
+        if data.len() > MAXIMUM_REPARSE_DATA_BUFFER_BYTES {
+            return Err(STATUS_REPARSE_POINT_NOT_RESOLVED.into());
+        }
+        if buffer.len() < data.len() {
+            return Err(STATUS_BUFFER_TOO_SMALL.into());
+        }
+        buffer[..data.len()].copy_from_slice(&data);
+        Ok(data.len() as u64)
     }
 
     /// Translate an XFS inode into a Windows file-attribute bitmap.
@@ -1006,8 +1141,17 @@ mod winfsp_adapter {
             &self,
             file_name: &U16CStr,
             _security_descriptor: Option<&mut [c_void]>,
-            _resolve_reparse: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
+            resolve_reparse: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
         ) -> FspResult<FileSecurity> {
+            // WinFsp asks for attributes before it opens anything, and a
+            // path containing a link anywhere is its chance to be told:
+            // returning the resolver's answer makes it resolve the link
+            // and call back with the rewritten path. Looking the path up
+            // ourselves first would report the link's own inode and the
+            // caller would never reach the target.
+            if let Some(security) = resolve_reparse(file_name) {
+                return Ok(security);
+            }
             let unix_path = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
             let read_only = self.is_read_only();
             // Overlay-first lookup. A `Deleted` tombstone hides any
@@ -1274,16 +1418,45 @@ mod winfsp_adapter {
         // -----------------------------------------------------------------
         // Reparse-point / symlink support.
         //
-        // We surface symlinks via FILE_ATTRIBUTE_REPARSE_POINT + the
-        // IO_REPARSE_TAG_SYMLINK tag. Implementing the full
-        // `get_reparse_point` callback would require synthesising the
-        // REPARSE_DATA_BUFFER on the wire. Phase 0 keeps this simple
-        // by resolving symlinks within the XFS layer when explicitly
-        // asked (via `Filesystem::resolve_path`), and otherwise treats
-        // them as opaque entries Explorer can show but not traverse
-        // automatically. A future revision can wire `get_reparse_point`
-        // through if symlink-traversal is needed.
+        // XFS stores a link's target inside the inode, Windows stores it
+        // in a reparse buffer attached to the entry, so the driver has to
+        // translate on demand. Both callbacks below answer for links only;
+        // anything else reports STATUS_NOT_A_REPARSE_POINT, which is how
+        // WinFsp's resolver is told to keep walking the path.
+        //
+        // Overlays are not consulted: a staged entry has no link kind, so
+        // every link is an underlay object.
         // -----------------------------------------------------------------
+
+        fn get_reparse_point_by_name(
+            &self,
+            file_name: &U16CStr,
+            _is_directory: bool,
+            buffer: &mut [u8],
+        ) -> FspResult<u64> {
+            let unix_path = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+            fill_link_reparse_buffer(self.fs(), &unix_path, buffer)
+        }
+
+        fn get_reparse_point(
+            &self,
+            context: &Self::FileContext,
+            _file_name: &U16CStr,
+            buffer: &mut [u8],
+        ) -> FspResult<u64> {
+            fill_link_reparse_buffer(self.fs(), &context.unix_path, buffer)
+        }
+
+        fn set_reparse_point(
+            &self,
+            _context: &Self::FileContext,
+            _file_name: &U16CStr,
+            _buffer: &[u8],
+        ) -> FspResult<()> {
+            // Links are not staged in the overlay either, so there is
+            // nowhere to put one.
+            Err(STATUS_INVALID_DEVICE_REQUEST.into())
+        }
 
         fn set_security(
             &self,
@@ -1616,6 +1789,12 @@ mod winfsp_adapter {
             .case_preserved_names(true)
             .unicode_on_disk(true)
             .filesystem_name("xfs");
+        // Reparse support has to be advertised, not merely implemented:
+        // without the volume flag the redirector answers
+        // FSCTL_GET_REPARSE_POINT with ERROR_INVALID_FUNCTION, so
+        // `fsutil reparsepoint query` and Explorer's "Target" column stay
+        // empty even though resolution through the callbacks works.
+        params.reparse_points(true);
         // `--ro` actually means read-only now: flip the volume flag so
         // the cache manager short-circuits writes at the kernel level
         // and Explorer renders the volume as RO. Writable is the default.
