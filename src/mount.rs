@@ -561,7 +561,7 @@ mod winfsp_adapter {
     use anyhow::{anyhow, Context, Result};
     use std::collections::BTreeSet;
     use std::ffi::c_void;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use widestring::U16CStr;
     use windows::Win32::Foundation::{
         STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST, STATUS_MEDIA_WRITE_PROTECTED,
@@ -758,6 +758,12 @@ mod winfsp_adapter {
         /// True if this open handle has been marked for delete via
         /// `set_delete`. The actual tombstone is staged in `cleanup`.
         pub pending_delete: Mutex<bool>,
+        /// The merged directory listing, built on the first
+        /// `read_directory` call for this handle and replayed by every
+        /// later buffer. Rebuilding it per buffer re-reads every child
+        /// inode, which is quadratic in the entry count: measured
+        /// 12386 raw reads to enumerate a 461-entry directory.
+        pub dir_listing: Mutex<Option<Arc<Vec<MergedEntry>>>>,
     }
 
     /// Filesystem-wide state shared across all WinFsp callbacks.
@@ -785,6 +791,80 @@ mod winfsp_adapter {
 
         fn is_read_only(&self) -> bool {
             self.mount.write_mode == WriteMode::ReadOnly
+        }
+
+        /// Build the merged listing for a directory: underlay entries
+        /// first, with overlay-tombstoned names filtered out, then
+        /// overlay-only Created / CreatedDir entries appended, sorted by
+        /// name.
+        ///
+        /// Sorting matters because WinFsp's DirInfo buffer expects
+        /// insertion in name order for resume-after-marker correctness.
+        ///
+        /// This is the expensive half of enumeration -- it reads the
+        /// directory blocks and then one inode per child -- so callers
+        /// must not run it once per output buffer. See
+        /// [`XfsFileContext::dir_listing`].
+        fn build_merged_listing(&self, context: &XfsFileContext) -> Vec<MergedEntry> {
+            // 1. Build the underlay child set.
+            let underlay_inode = context.inode.lock().unwrap().clone();
+            let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
+            if let Some(inode) = underlay_inode.as_ref() {
+                if let Ok(children) = read_children(self.fs(), inode) {
+                    for e in children {
+                        if e.name == b"." || e.name == b".." {
+                            continue;
+                        }
+                        let name = match std::str::from_utf8(&e.name) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => continue,
+                        };
+                        let child_path = if context.unix_path == "/" {
+                            format!("/{name}")
+                        } else {
+                            format!("{}/{}", context.unix_path, name)
+                        };
+                        // Tombstoned: skip.
+                        if matches!(
+                            self.mount.overlay.lookup(&child_path),
+                            OverlayLookup::Deleted
+                        ) {
+                            continue;
+                        }
+                        if let Ok(child) = self.fs().read_inode(e.ino) {
+                            underlay_pairs.push((name, child));
+                        }
+                    }
+                }
+            }
+
+            // 2. Overlay-only entries under this dir.
+            let mut overlay_pairs: Vec<(String, OverlayEntry)> = Vec::new();
+            let mut underlay_names: BTreeSet<String> =
+                underlay_pairs.iter().map(|(n, _)| n.clone()).collect();
+            for (leaf, entry) in self.mount.overlay.iter_dir(&context.unix_path) {
+                if entry.is_deleted() {
+                    continue;
+                }
+                if underlay_names.contains(&leaf) {
+                    // Overlay shadows underlay — replace the underlay
+                    // pair with the overlay entry.
+                    underlay_pairs.retain(|(n, _)| n != &leaf);
+                    underlay_names.remove(&leaf);
+                }
+                overlay_pairs.push((leaf, entry));
+            }
+
+            // 3. Sort merged listing for deterministic resume.
+            let mut all: Vec<MergedEntry> = Vec::new();
+            for (name, inode) in underlay_pairs {
+                all.push(MergedEntry::Underlay(name, inode));
+            }
+            for (name, entry) in overlay_pairs {
+                all.push(MergedEntry::Overlay(name, entry));
+            }
+            all.sort_by(|a, b| a.name().cmp(b.name()));
+            all
         }
 
         /// `true` if the volume must reject write callbacks. On a
@@ -909,6 +989,7 @@ mod winfsp_adapter {
                         is_dir,
                         inode: Mutex::new(None),
                         pending_delete: Mutex::new(false),
+                        dir_listing: Mutex::new(None),
                     })
                 }
                 OverlayLookup::Miss => {
@@ -920,6 +1001,7 @@ mod winfsp_adapter {
                         is_dir,
                         inode: Mutex::new(Some(inode)),
                         pending_delete: Mutex::new(false),
+                        dir_listing: Mutex::new(None),
                     })
                 }
             }
@@ -1028,87 +1110,48 @@ mod winfsp_adapter {
             }
             let read_only = self.is_read_only();
 
-            // Build the merged listing: underlay entries first, with
-            // overlay-tombstoned names filtered out, then overlay-only
-            // Created / CreatedDir entries appended.
+            // WinFsp drains a directory one buffer at a time, calling us
+            // again for each refill. Building the listing per call would
+            // re-read every child inode every time -- quadratic in the
+            // entry count, and measured at 12386 raw reads for a
+            // 461-entry directory -- so on a read-only mount we build it
+            // once per handle and replay it.
             //
-            // We materialise into a sorted Vec<(name, FileInfo)> because
-            // WinFsp's DirInfo buffer expects insertion in name order
-            // for resume-after-marker correctness.
-
-            // 1. Build the underlay child set.
-            let underlay_inode = context.inode.lock().unwrap().clone();
-            let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
-            if let Some(inode) = underlay_inode.as_ref() {
-                if let Ok(children) = read_children(self.fs(), inode) {
-                    for e in children {
-                        if e.name == b"." || e.name == b".." {
-                            continue;
+            // A writable mount is excluded on purpose: staged overlay
+            // changes must show up in a listing that is still being
+            // drained.
+            let listing: Arc<Vec<MergedEntry>> = {
+                let mut slot = context.dir_listing.lock().unwrap();
+                let cached = if read_only { slot.clone() } else { None };
+                match cached {
+                    Some(existing) => existing,
+                    None => {
+                        let fresh = Arc::new(self.build_merged_listing(context));
+                        if read_only {
+                            *slot = Some(fresh.clone());
                         }
-                        let name = match std::str::from_utf8(&e.name) {
-                            Ok(s) => s.to_string(),
-                            Err(_) => continue,
-                        };
-                        let child_path = if context.unix_path == "/" {
-                            format!("/{name}")
-                        } else {
-                            format!("{}/{}", context.unix_path, name)
-                        };
-                        // Tombstoned: skip.
-                        if matches!(
-                            self.mount.overlay.lookup(&child_path),
-                            OverlayLookup::Deleted
-                        ) {
-                            continue;
-                        }
-                        if let Ok(child) = self.fs().read_inode(e.ino) {
-                            underlay_pairs.push((name, child));
-                        }
+                        fresh
                     }
                 }
-            }
+            };
 
-            // 2. Overlay-only entries under this dir.
-            let mut overlay_pairs: Vec<(String, OverlayEntry)> = Vec::new();
-            let mut underlay_names: BTreeSet<String> =
-                underlay_pairs.iter().map(|(n, _)| n.clone()).collect();
-            for (leaf, entry) in self.mount.overlay.iter_dir(&context.unix_path) {
-                if entry.is_deleted() {
-                    continue;
+            // Resume strictly after the marker. The listing is sorted by
+            // name, so this is a binary search rather than a scan; and
+            // unlike a "find the exact name" walk it still does the right
+            // thing if the marker name is somehow absent.
+            let start = match marker.inner_as_cstr() {
+                Some(m) => {
+                    let want = m.to_string_lossy();
+                    listing.partition_point(|e| e.name() <= want.as_str())
                 }
-                if underlay_names.contains(&leaf) {
-                    // Overlay shadows underlay — replace the underlay
-                    // pair with the overlay entry.
-                    underlay_pairs.retain(|(n, _)| n != &leaf);
-                    underlay_names.remove(&leaf);
-                }
-                overlay_pairs.push((leaf, entry));
-            }
+                None => 0,
+            };
 
-            // 3. Sort merged listing for deterministic resume.
-            let mut all: Vec<MergedEntry> = Vec::new();
-            for (name, inode) in underlay_pairs {
-                all.push(MergedEntry::Underlay(name, inode));
-            }
-            for (name, entry) in overlay_pairs {
-                all.push(MergedEntry::Overlay(name, entry));
-            }
-            all.sort_by(|a, b| a.name().cmp(b.name()));
-
-            // 4. Resume after marker if set.
-            let resume_after = marker.inner_as_cstr().map(|m| m.to_string_lossy());
-            let mut started = resume_after.is_none();
             let mut cursor: u32 = 0;
             let mut dir_info: DirInfo<255> = DirInfo::new();
 
-            for entry in &all {
+            for entry in &listing[start..] {
                 let name = entry.name();
-                if !started {
-                    if Some(name.to_string()) == resume_after.as_ref().map(|s| s.to_string()) {
-                        started = true;
-                    }
-                    continue;
-                }
                 dir_info.reset();
                 match entry {
                     MergedEntry::Underlay(_, inode) => {
@@ -1220,6 +1263,7 @@ mod winfsp_adapter {
                     is_dir: true,
                     inode: Mutex::new(None),
                     pending_delete: Mutex::new(false),
+                    dir_listing: Mutex::new(None),
                 })
             } else {
                 self.mount
@@ -1235,6 +1279,7 @@ mod winfsp_adapter {
                     is_dir: false,
                     inode: Mutex::new(None),
                     pending_delete: Mutex::new(false),
+                    dir_listing: Mutex::new(None),
                 })
             }
         }
