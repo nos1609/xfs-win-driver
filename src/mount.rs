@@ -72,6 +72,79 @@ impl BlockRead for PartitionDevice {
     }
 }
 
+// Every `BlockDevice` method is defaulted to a strict read-only device
+// (`write_at -> Err(ReadOnly)`, `is_writable -> false`), so this impl
+// buys nothing but the trait bound `CachingDevice` requires. It does not
+// make the volume writable. A future write path must go through a type
+// that overrides those defaults, not through this one.
+impl fs_core::BlockDevice for PartitionDevice {}
+
+/// Blocks held by the metadata read-cache (16 MiB at a 4 KiB granularity).
+///
+/// The bound is a trade-off, not a computation: it has to cover one wide
+/// directory's data blocks plus the directories on the paths currently
+/// being resolved, and must stay small enough to be invisible next to
+/// the operating system's own cache. A 461-entry directory needs a few
+/// dozen blocks, so this holds a hundred or more directories.
+///
+/// Public so `examples/perf_count.rs` measures the real thing rather
+/// than a copy of these parameters.
+pub const CACHE_BLOCKS: usize = 4096;
+
+/// Wrap a partition view in a block cache sized to its directory blocks.
+///
+/// `am-fs-xfs` has no cache of its own and re-derives everything:
+/// `Filesystem::open` walks every path component from the root inode,
+/// and each step calls `lookup`, which runs `read_dir` over the *whole*
+/// directory. Enumerating one 461-entry directory therefore issued
+/// ~12 400 raw reads (process `IOReadOperations`), against ~30 blocks
+/// of actual directory data. Caching at this layer turns every repeat
+/// read of a block into a memcpy and leaves the reader untouched.
+///
+/// Granularity is `dirblocksize`, because directory data is what the
+/// repetition is in. Inode (512 B) and B-tree (blocksize) reads fall
+/// outside it and pass straight through -- `CachingDevice` matches an
+/// entry only for reads of exactly one whole block. That is deliberate:
+/// picking a finer granularity to catch inodes would drop the reads
+/// that dominate.
+///
+/// The superblock is parsed here rather than taken from the mounted
+/// filesystem, because the geometry has to be known before the device
+/// is handed over. It costs one extra 4 KiB read at mount time.
+///
+/// Public, and generic over `BlockDevice` rather than taking a
+/// `PartitionDevice`, so `examples/perf_count.rs` can put a counting
+/// device underneath the same cache and measure real read counts.
+pub fn metadata_cache(
+    dev: Arc<dyn fs_core::BlockDevice>,
+    image: &Path,
+) -> Result<Arc<fs_core::CachingDevice>> {
+    let mut head = vec![0u8; 4096];
+    dev.read_at(0, &mut head)
+        .with_context(|| format!("reading superblock of {}", image.display()))?;
+    let sb = fs_xfs::Superblock::parse(&head)
+        .map_err(|e| anyhow!("parsing superblock of {}: {e}", image.display()))?;
+    // Two layers, because `CachingDevice` matches a read only when it is
+    // exactly one whole block, and XFS metadata arrives at two sizes.
+    // Directory data -- the re-read that dominates -- is one
+    // `dirblocksize` per read; an inode is one `inodesize` record, and
+    // every path walk re-reads the inodes of the directories it passes
+    // through. One granularity would have to choose between them.
+    //
+    // The inner layer never serves the outer's misses (a 4 KiB read is
+    // not one 512 B block), so the two do not duplicate bytes.
+    let records = fs_core::CachingDevice::new(
+        dev,
+        u64::from(sb.inodesize),
+        CACHE_BLOCKS,
+    );
+    Ok(fs_core::CachingDevice::new(
+        records as Arc<dyn fs_core::BlockDevice>,
+        u64::from(sb.dirblocksize()),
+        CACHE_BLOCKS,
+    ))
+}
+
 /// What to do with the in-memory read-write overlay when the user
 /// presses Ctrl-C / dismounts. XFS is read-only at the format level,
 /// so any writes the user made through the WinFsp surface are
@@ -169,8 +242,9 @@ impl Mount {
         // to whether it's reading the full file or a partition slice.
         let src: Arc<dyn BlockSource> = Arc::new(FileSource::open(image)?);
         let len = src.size();
-        let dev: Arc<dyn BlockRead> = Arc::new(PartitionDevice { src, base: 0, len });
-        let fs = Filesystem::mount(dev).map_err(|e| {
+        let dev = Arc::new(PartitionDevice { src, base: 0, len });
+        let cached = metadata_cache(dev as Arc<dyn fs_core::BlockDevice>, image)?;
+        let fs = Filesystem::mount(cached).map_err(|e| {
             anyhow!(
                 "open XFS at {}: {e}{}",
                 image.display(),
@@ -211,8 +285,9 @@ impl Mount {
                 src.size()
             );
         }
-        let dev: Arc<dyn BlockRead> = Arc::new(PartitionDevice { src, base, len });
-        let fs = Filesystem::mount(dev).map_err(|e| {
+        let dev = Arc::new(PartitionDevice { src, base, len });
+        let cached = metadata_cache(dev as Arc<dyn fs_core::BlockDevice>, image)?;
+        let fs = Filesystem::mount(cached).map_err(|e| {
             anyhow!(
                 "open XFS at {} partition {n} ({}): {e}",
                 image.display(),
@@ -761,8 +836,10 @@ mod winfsp_adapter {
         /// The merged directory listing, built on the first
         /// `read_directory` call for this handle and replayed by every
         /// later buffer. Rebuilding it per buffer re-reads every child
-        /// inode, which is quadratic in the entry count: measured
-        /// 12386 raw reads to enumerate a 461-entry directory.
+        /// inode. Memoising it measured no wall-clock gain -- the reads
+        /// that dominated were elsewhere, in path resolution, and are
+        /// what [`metadata_cache`] now absorbs -- but a wide directory
+        /// still costs one inode read per entry per buffer without it.
         pub dir_listing: Mutex<Option<Arc<Vec<MergedEntry>>>>,
     }
 
@@ -1484,7 +1561,7 @@ mod winfsp_adapter {
     /// Helper enum for `read_directory`'s merge step. Holds either an
     /// underlay-resolved `Inode` (cheap clone) or an `OverlayEntry`
     /// (already cloned out of the overlay map).
-    enum MergedEntry {
+    pub(crate) enum MergedEntry {
         Underlay(String, Inode),
         Overlay(String, OverlayEntry),
     }
