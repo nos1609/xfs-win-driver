@@ -77,16 +77,32 @@
           Start=auto is not what the running service should be. A watcher
           that enumerates every disk and asks the launcher to publish volumes
           belongs after the boot-critical work, and the live service is
-          configured Automatic (Delayed Start): `sc config XfsWatcher
-          start= delayed-auto` leaves Start=2 plus DelayedAutostart=1 under
-          the service key, which is
-          SERVICE_CONFIG_DELAYED_AUTO_START_INFO -- a ChangeServiceConfig2
-          call, not a column of the MSI Services table. So `Start="auto"`
-          here can only ever mean plain automatic, and the gap is real rather
-          than cosmetic. Closing it needs the WiX element for delayed start or
+          configured Automatic (Delayed Start).
+
+          MSI can express this, but not through the Services table: delayed
+          start is a row in the MsiServiceConfig table -- ConfigType
+          SERVICE_CONFIG_DELAYED_AUTO_START (3), Argument 1 -- processed by
+          the MsiConfigureServices standard action, sequenced after
+          InstallServices and before StartServices, and only for a service
+          installed with SERVICE_AUTO_START. See
+          https://learn.microsoft.com/windows/win32/msi/msiserviceconfig-table
+          and .../msiconfigureservices-action. So `Start="auto"` here can
+          still only mean plain automatic -- the attribute has nowhere to put
+          the delay -- and the row has to come from the toolchain, which is
+          why this is not just a missing line of XML. Closing it needs the WiX element for delayed start or
           a deferred custom action running `sc config` -- not guessed markup
           into a component that runs as LocalSystem, so it is left to a run
           where the WiX toolset is installed and the XML actually compiles.
+
+          Worth knowing before treating the custom-action route as the cheap
+          one: Microsoft documents the sibling feature
+          MsiServiceConfigFailureActions -- service recovery actions -- as
+          "not working as expected" in MSI 5.0 and tells developers to run
+          `sc.exe` from a custom action instead
+          (https://learn.microsoft.com/windows/win32/msi/msiconfigureservices-action).
+          So `sc config` / `sc failure` from a script is not a downgrade from
+          MSI here; on this machine it is what actually produced the verified
+          Start=2 + DelayedAutostart=1 pair.
 
           WiX 7 note: <ServiceInstall> + <ServiceControl> are direct
           children of <Component>, not nested inside <File> (the WiX 4/5
