@@ -71,9 +71,22 @@
           argument, enters Windows-service mode and registers with SCM under
           this name. Account=LocalSystem because the watcher signals
           WinFsp.Launcher (which expects an elevated caller) and needs to
-          resolve volume devices in any session. Start=auto so it comes up
-          at boot. <ServiceControl> guarantees stop+remove on uninstall and
-          major-upgrade.
+          resolve volume devices in any session. <ServiceControl> guarantees
+          stop+remove on uninstall and major-upgrade.
+
+          Start=auto is not what the running service should be. A watcher
+          that enumerates every disk and asks the launcher to publish volumes
+          belongs after the boot-critical work, and the live service is
+          configured Automatic (Delayed Start): `sc config XfsWatcher
+          start= delayed-auto` leaves Start=2 plus DelayedAutostart=1 under
+          the service key, which is
+          SERVICE_CONFIG_DELAYED_AUTO_START_INFO -- a ChangeServiceConfig2
+          call, not a column of the MSI Services table. So `Start="auto"`
+          here can only ever mean plain automatic, and the gap is real rather
+          than cosmetic. Closing it needs the WiX element for delayed start or
+          a deferred custom action running `sc config` -- not guessed markup
+          into a component that runs as LocalSystem, so it is left to a run
+          where the WiX toolset is installed and the XML actually compiles.
 
           WiX 7 note: <ServiceInstall> + <ServiceControl> are direct
           children of <Component>, not nested inside <File> (the WiX 4/5
@@ -178,7 +191,7 @@
           <RegistryValue
               Type="string"
               Name="CommandLine"
-              Value="mount %2 --drive %1 --part %3" />
+              Value="mount %2 --drive %1 --part %3 --ro" />
           <RegistryValue
               Type="string"
               Name="WorkDirectory"
