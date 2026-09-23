@@ -188,39 +188,9 @@ jobs:
         # and the header patch below reaches into that checkout.
 
       - name: check out sibling repos
-        # chore publishes darwin and linux builds only, and `uname -s`
-        # under Git Bash reports MINGW64_NT-*, so there is nothing to
-        # install here. Cloning directly restates what `chore siblings`
-        # does — which is the duplication chores.yml exists to remove —
-        # so it reads the refs OUT OF chores.yml rather than hardcoding
-        # them, and the single declaration still holds.
-        shell: bash
-        run: |
-          set -euo pipefail
-          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
-          # URL as well as ref. The family is not all in one org, so
-          # reconstructing a URL from the repo name silently points at a
-          # repo that does not exist -- and git then prompts for
-          # credentials, so the run dies with "could not read Username",
-          # which reads as an auth problem rather than a wrong URL.
-          printf '%s\t%s\t%s\n' \
-            rust-fs-core       "$(pin FS_CORE_URL)" "$(pin FS_CORE_REF)" \
-            rust-fs-xfs      "$(pin FS_XFS_URL)" "$(pin FS_XFS_REF)" \
-            winfsp-fs-skeleton "$(pin SKELETON_URL)" "$(pin SKELETON_REF)" \
-            fs-test-harness    "$(pin HARNESS_URL)" "$(pin HARNESS_REF)" \
-            winfsp-rs          "$(pin WINFSP_RS_URL)" "$(pin WINFSP_RS_REF)" \
-          | while IFS="$(printf '\t')" read -r name url ref; do
-              echo "cloning $name at $ref"
-              # init + fetch-by-ref, not clone. winfsp-rs is pinned to a
-              # bare commit that no published branch contains, so a
-              # plain clone does not have it and `--branch` cannot name
-              # it. Asking the server for the SHA directly does work.
-              git init --quiet "../$name"
-              git -C "../$name" remote add origin "$url"
-              git -C "../$name" fetch --quiet --depth 1 origin "$ref"
-              git -C "../$name" checkout --quiet FETCH_HEAD
-            done
-
+        # The logic lives in .github/actions/siblings, so every Windows job
+        # carries one copy of it; the refs still come from chores.yml.
+        uses: ./.github/actions/siblings
       - name: install Rust + gnullvm target
         shell: pwsh
         run: |

@@ -90,6 +90,28 @@ entries minus ours, so anything added after us survives and no other entry is
 reordered. WinFsp is left alone: it may be serving sshfs-win, rclone or
 another driver from this family.
 
+## Tests
+
+The scripts are covered by Pester specs in `tests/pester/installer.Tests.ps1`:
+
+```powershell
+pwsh -File tests/pester/run.ps1
+```
+
+They are not coverage for its own sake -- each spec is a mistake that actually
+happened. A running service locking its own binary; `sc config` quoting that
+works under PowerShell 7 and returns 1639 under 5.1; `[Environment]`
+rewriting the system PATH from `REG_EXPAND_SZ` to `REG_SZ`; an installer that
+copies a file the packager never staged; a workflow still calling
+`installer/build.ps1` after it was deleted. The specs also assert that
+`--ro`, the `WOW6432Node` path and delayed start are still present, because
+each of those can go missing without any build failing.
+
+`.github/workflows/release.yml` runs the same specs before packaging, and then
+installs from the finished zip on the runner and uninstalls it, asserting the
+service, the registry values, the PATH round trip and that `xfs.exe` executes
+on the architecture it claims.
+
 ## Build
 
 ```powershell

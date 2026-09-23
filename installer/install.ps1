@@ -129,7 +129,7 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 Copy-Item -Path $ExePath -Destination (Join-Path $InstallDir 'xfs.exe') -Force
-foreach ($helper in @('install.ps1', 'uninstall.ps1', 'Mount-Xfs.ps1', 'winfsp-pin.ps1', 'machine-path.ps1')) {
+foreach ($helper in @('install.ps1', 'uninstall.ps1', 'Mount-Xfs.ps1', 'winfsp-pin.ps1', 'machine-path.ps1', 'README.md')) {
     $src = Join-Path $PSScriptRoot $helper
     if (Test-Path $src) { Copy-Item -Path $src -Destination (Join-Path $InstallDir $helper) -Force }
 }

@@ -1,0 +1,49 @@
+name: check out sibling repos
+description: >
+  Clone the family repos this crate path-depends on, at the refs chores.yml
+  pins, next to this checkout.
+
+# Why this exists as its own action instead of a step in each workflow: the
+# logic is not obvious, it is needed by every Windows job, and the moment it
+# was duplicated the release workflow had drifted into a version that could
+# not work. Both ci.yml and release.yml now call this.
+#
+# Why not `chore siblings`: chore publishes darwin and linux builds only, and
+# `uname -s` under Git Bash reports MINGW64_NT-*, so there is no chore to run
+# on a Windows runner. Cloning by hand restates what `chore siblings` does --
+# which is the duplication chores.yml exists to remove -- so the refs are read
+# OUT OF chores.yml here, and the single declaration still holds.
+#
+# Why `git init` + `fetch` rather than `git clone` + `checkout`: winfsp-rs is
+# pinned to a bare commit that no published branch contains, so a clone has no
+# such object and `--branch` cannot name it. Asking the server for the SHA
+# directly is what works.
+#
+# Why the URL is read too instead of being reconstructed from the repo name:
+# the family is not all in one org, and a wrong URL makes git prompt for
+# credentials, so the failure arrives as "could not read Username" and reads
+# like an auth problem rather than a bad remote.
+
+inputs: {}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+        printf '%s\t%s\t%s\n' \
+          rust-fs-core       "$(pin FS_CORE_URL)"   "$(pin FS_CORE_REF)" \
+          rust-fs-xfs        "$(pin FS_XFS_URL)"    "$(pin FS_XFS_REF)" \
+          winfsp-fs-skeleton "$(pin SKELETON_URL)"  "$(pin SKELETON_REF)" \
+          fs-test-harness    "$(pin HARNESS_URL)"   "$(pin HARNESS_REF)" \
+          winfsp-rs          "$(pin WINFSP_RS_URL)" "$(pin WINFSP_RS_REF)" \
+        | while IFS="$(printf '\t')" read -r name url ref; do
+            [ -n "$url" ] && [ -n "$ref" ] || { echo "chores.yml: missing URL or REF for $name" >&2; exit 1; }
+            echo "cloning $name at $ref"
+            git init --quiet "../$name"
+            git -C "../$name" remote add origin "$url"
+            git -C "../$name" fetch --quiet --depth 1 origin "$ref"
+            git -C "../$name" checkout --quiet FETCH_HEAD
+            git -C "../$name" rev-parse --short HEAD
+          done

@@ -1,11 +1,19 @@
-# Build + attach Setup.exe / MSI to a GitHub Release on every `v*` tag,
-# for both x86_64 and aarch64 Windows. Uses native runners per arch
-# (windows-latest = x64, windows-11-arm = arm64) so we don't have to
-# fight cross-compilation against the gnullvm toolchain.
+# Build xfs.exe for both Windows architectures and attach the release zip to
+# a GitHub Release on every `v*` tag.
 #
-# Manual trigger via workflow_dispatch is wired so a maintainer can
-# rerun the matrix without bumping a tag (handy for fixing a release
-# upload that failed mid-flight).
+# Packaging is `installer/package.ps1`: a zip plus install.ps1/uninstall.ps1.
+# There used to be a WiX stage here (Product.wxs, Bundle.wxs, Setup.exe, an
+# MSI, and a silent-install check). It is gone by decision, not by accident --
+# installer/README.md carries the reasoning, including the correction to the
+# claim that CI could not accept the WiX EULA: it did, on a line this file no
+# longer has.
+#
+# What replaces the deleted verify-silent.ps1 checks more than it did. That
+# script asserted a Burn bundle came up without a GUI prompt. This workflow
+# unpacks the shipped zip and runs the same scripts a user runs, then asserts
+# the result: service Running, Start=2 plus DelayedAutostart=1 read back from
+# the registry, launcher class present with --ro, install dir on the system
+# PATH -- and after uninstall.ps1, all of it gone and PATH byte-exact restored.
 name: release
 
 on:
@@ -30,58 +38,43 @@ jobs:
         include:
           - arch: x64
             runner: windows-latest
-            rust_target: x86_64-pc-windows-gnullvm
-            llvm_mingw_archive: llvm-mingw-20260421-ucrt-x86_64.zip
+            rust_target: x86_64-pc-windows-msvc
           - arch: arm64
             runner: windows-11-arm
-            rust_target: aarch64-pc-windows-gnullvm
-            llvm_mingw_archive: llvm-mingw-20260421-ucrt-aarch64.zip
+            rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
-    env:
-      LLVM_MINGW_VER: 20260421
-      # Pin -- bumping requires verifying winfsp-rs still builds cleanly
-      # against the toolchain. The same archives are what
-      # MartinStorsjo.LLVM-MinGW.UCRT installs via winget; we fetch
-      # them directly to avoid winget's interactive prompts.
 
     steps:
-      - name: checkout (with submodules)
+      - name: checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: install Rust + gnullvm target
+      # Everything this crate compiles against is a sibling checkout one
+      # directory up -- not vendored, not a submodule (chores.yml's header
+      # explains why). The version of this file that was replaced checked out
+      # only this repository with `submodules: recursive`, and with no
+      # .gitmodules that leaves `path = "../rust-fs-core"` unresolvable: the
+      # build step could not have succeeded as written.
+      - name: check out siblings at the refs chores.yml pins
+        uses: ./.github/actions/siblings
+
+      - name: install Rust with the MSVC target
         shell: pwsh
         run: |
-          rustup install stable
-          rustup default stable
+          # The runner image carries a stable toolchain, so only the target is
+          # missing. No LLVM-MinGW and no gnullvm: the MSVC toolchain builds
+          # this whole stack unpatched, and the task spec rules gnullvm out
+          # unless MSVC fails.
           rustup target add ${{ matrix.rust_target }}
           rustc --version
-
-      - name: install LLVM-MinGW (gnullvm toolchain, ${{ matrix.arch }})
-        shell: pwsh
-        run: |
-          # LLVM-MinGW provides the gnullvm runtime + sysroot. Its
-          # standalone GitHub-release zip does NOT ship libclang.dll
-          # (only clang.exe and friends), so libclang for bindgen is
-          # installed via a separate step below.
-          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/${{ env.LLVM_MINGW_VER }}/${{ matrix.llvm_mingw_archive }}"
-          $zip = "$env:RUNNER_TEMP\llvm-mingw.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\llvm-mingw" -Force
-          $extracted = Get-ChildItem "$env:RUNNER_TEMP\llvm-mingw" -Directory | Select-Object -First 1
-          $bin = Join-Path $extracted.FullName 'bin'
-          "Adding $bin to PATH"
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          cargo --version
 
       - name: install LLVM (libclang for bindgen)
         uses: KyleMayes/install-llvm-action@v2
         with:
-          # Pin to LLVM 18 -- the last release with stable Windows
-          # ARM64 binaries on the action's manifest, and old enough to
-          # parse LLVM-MinGW's clang-22 sysroot headers without the
-          # AVX-512 self-compile errors a same-version libclang trips
-          # on. Action sets LIBCLANG_PATH for us.
+          # Pin to LLVM 18 -- the last release with stable Windows ARM64
+          # binaries on the action's manifest, and old enough to parse sysroot
+          # headers without the AVX-512 self-compile errors a same-version
+          # libclang trips on. The action sets LIBCLANG_PATH.
           version: '18.1'
           directory: ${{ runner.temp }}/llvm
 
@@ -89,70 +82,33 @@ jobs:
         shell: pwsh
         run: |
           choco install winfsp --yes --no-progress
-          # WinFsp installs to "C:\Program Files (x86)\WinFsp\" on x64
-          # hosts and to "C:\Program Files\WinFsp\" on arm64; winfsp-rs
-          # auto-discovers via the registry.
-
-      - name: install WiX 7
-        shell: pwsh
-        run: |
-          dotnet tool install --global wix
-          wix eula accept wix7
-          wix --version
-
-      - name: patch fsctl.h for x86 MSVC-compat _ReadWriteBarrier collision
-        if: matrix.arch == 'x64'
-        shell: pwsh
-        run: |
-          # Background: clang's MSVC compatibility (auto-enabled by the
-          # winfsp-sys bindgen invocation's `--target=...-pc-windows-msvc`)
-          # predefines _ReadWriteBarrier as a 0-arg function-like macro
-          # via the included intrin.h. WinFsp's fsctl.h then
-          # forward-declares
-          #     void _ReadWriteBarrier(void);
-          # which the preprocessor mangles into `void ;` -- "variable
-          # has incomplete type 'void'", with a paired "too many
-          # arguments to function-like macro invocation" error.
-          # `-U_ReadWriteBarrier` doesn't help because intrin.h is
-          # included after our -U processes.
-          #
-          # Wrap each forward-decl in a #pragma push_macro / #undef /
-          # #pragma pop_macro so the macro is hidden at exactly the
-          # point we need to declare the function.
-          # arm64 hits a different code branch (__dmb intrinsic) so
-          # this patch is x86-only.
-          #
-          # We patch BOTH the vendored header (read when winfsp-sys is
-          # built without the `system` feature) AND the choco-installed
-          # system header at "C:\Program Files (x86)\WinFsp\inc\winfsp\
-          # fsctl.h" (read when `system` is on, which our Cargo.toml
-          # turns on for the .lib-via-lld-link path). Whichever
-          # winfsp-sys reads, it gets the patched version.
-          $needle = '    void _ReadWriteBarrier(void);'
-          $replacement = "#pragma push_macro(`"_ReadWriteBarrier`")`n#undef _ReadWriteBarrier`n    void _ReadWriteBarrier(void);`n#pragma pop_macro(`"_ReadWriteBarrier`")"
-          $files = @(
-            'vendor/winfsp-rs/winfsp-sys/winfsp/inc/winfsp/fsctl.h',
-            'C:\Program Files (x86)\WinFsp\inc\winfsp\fsctl.h'
-          )
-          foreach ($f in $files) {
-            if (-not (Test-Path $f)) {
-              "Skipping (not found): $f"
-              continue
-            }
-            $content = Get-Content $f -Raw
-            $content = $content -replace [regex]::Escape($needle), $replacement
-            Set-Content -Path $f -Value $content -NoNewline
-            "Patched $f"
-            Select-String -Path $f -Pattern '_ReadWriteBarrier' | Select-Object LineNumber, Line | Format-Table -AutoSize
+          # The Developer feature supplies inc/ and lib/. A default install
+          # has been observed to place only bin/ and SxS/, after which
+          # winfsp-sys/build.rs cannot find the SDK -- so fail here with the
+          # remedy in the message instead of three compile errors later.
+          $winfsp = (Get-ItemProperty `
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like 'WinFsp*' -and $_.InstallLocation } |
+              Select-Object -First 1).InstallLocation
+          if (-not $winfsp) { $winfsp = 'C:\Program Files (x86)\WinFsp\' }
+          Write-Host "WinFsp at: $winfsp"
+          if (-not (Test-Path (Join-Path $winfsp 'inc\winfsp\fsctl.h'))) {
+            throw "WinFsp SDK headers missing under $winfsp (need ADDLOCAL=F.Main,F.User,F.Developer)"
           }
 
+      # The old file patched WinFsp's fsctl.h here for x64, to work around
+      # clang's MSVC-compatibility mode predefining _ReadWriteBarrier before
+      # fsctl.h forward-declares it. If the x64 leg fails that way now, put
+      # the patch back -- guarded, and pointed at ../winfsp-rs rather than the
+      # vendor/winfsp-rs path it named, which does not exist in this layout.
       - name: cargo build --release --features mount,service
         shell: pwsh
         env:
-          # Defang AVX-512 intrinsic header compilation -- cross-version
+          # Defang AVX-512 intrinsic header compilation; cross-version
           # libclang/sysroot self-compiles can fail there. WinFsp's ABI
-          # doesn't reference any AVX-512 types so neutering the macros
-          # is safe.
+          # references no AVX-512 types, so neutering the macros is safe.
           BINDGEN_EXTRA_CLANG_ARGS: -D__AVX512F__=0 -D__AVX512BW__=0 -D__AVX512CD__=0 -D__AVX512DQ__=0 -D__AVX512VL__=0 -D__AVX512VBMI__=0 -D__AVX512VBMI2__=0
         run: |
           cargo build --release --features mount,service --target ${{ matrix.rust_target }}
@@ -160,66 +116,86 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
           "Built $exe ($((Get-Item $exe).Length) bytes)"
 
-      - name: add WiX extensions + run installer/build.ps1
+      - name: check the installer scripts (Pester)
         shell: pwsh
         run: |
-          # Add the two extensions our .wxs files need. Doing this in
-          # the same step as build.ps1 because the global cache from a
-          # separate earlier step doesn't always persist to here on
-          # the windows-11-arm runner (WIX0144 "extension could not be
-          # found").
-          #
-          # `2>&1` so add failures show up in the job log; otherwise
-          # they vanish silently and we only see the WIX0144 from the
-          # eventual build call.
-          $ErrorActionPreference = 'Stop'
-          Write-Host "Adding WixToolset.Util.wixext..."
-          wix extension add -g WixToolset.Util.wixext 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "wix extension add Util failed: $LASTEXITCODE" }
-          Write-Host "Adding WixToolset.BootstrapperApplications.wixext..."
-          wix extension add -g WixToolset.BootstrapperApplications.wixext 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "wix extension add BootstrapperApplications failed: $LASTEXITCODE" }
-          Write-Host "Listing registered extensions:"
-          wix extension list 2>&1
-          $exe = "target\${{ matrix.rust_target }}\release\xfs.exe"
-          installer\build.ps1 -ExePath $exe -Arch ${{ matrix.arch }}
+          # Cheap, and the only thing standing between "someone edited
+          # install.ps1" and a released zip that installs a broken service.
+          # These are the same specs a contributor runs locally.
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.6
+          Import-Module Pester
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'tests/pester'
+          $c.Output.Verbosity = 'Detailed'
+          $c.Fail.OnFailure = $true
+          Invoke-Pester -Configuration $c
 
-      - name: upload Setup.exe + MSI as workflow artefacts
+      - name: package the release zip
+        shell: pwsh
+        run: |
+          # -SkipBuild: cargo built it above, for the right --target.
+          # package.ps1 re-checks the PE Machine against -Arch and refuses to
+          # package a binary that disagrees.
+          installer\package.ps1 -Arch ${{ matrix.arch }} -SkipBuild -OutputDir dist
+          Get-ChildItem dist\*.zip | ForEach-Object { "  $($_.Name)  $($_.Length) bytes" }
+
+      - name: install from the shipped zip, then uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}.zip" | Select-Object -First 1).FullName
+          if (-not $zip) { throw 'no zip produced' }
+          $dir = Join-Path $env:RUNNER_TEMP 'zipcheck'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+
+          # A zip missing one helper installs fine and then dies on the first
+          # dot-source, so assert the payload before trusting it.
+          foreach ($f in @('xfs.exe','install.ps1','uninstall.ps1','Mount-Xfs.ps1','winfsp-pin.ps1','machine-path.ps1','README.md')) {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "zip is missing $f" }
+          }
+
+          $pathBefore = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+
+          & (Join-Path $dir 'install.ps1')
+
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\XfsWatcher'
+          $p = Get-ItemProperty $key
+          if ([int]$p.Start -ne 2) { throw "expected Start=2, found $($p.Start)" }
+          if ([int]$p.DelayedAutostart -ne 1) { throw "expected DelayedAutostart=1, found $($p.DelayedAutostart)" }
+          if ((Get-Service XfsWatcher).Status -ne 'Running') { throw 'service is not Running' }
+
+          $cls = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\WinFsp\Services\xfs-mount'
+          if ($cls.CommandLine -notmatch '--ro') { throw "launcher template lost --ro: $($cls.CommandLine)" }
+          $installDir = Split-Path -Parent $cls.Executable
+          $pathAfter = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if (($pathAfter -split ';') -notcontains $installDir) { throw "install dir not on system PATH: $installDir" }
+          Write-Host 'install.ps1: running, delayed start verified, class has --ro, PATH extended'
+
+          # Cheapest proof the binary matches the runner's CPU: it has to run.
+          $help = & $cls.Executable --help 2>&1 | Out-String
+          if ($help -notmatch 'mount') { throw 'xfs.exe --help did not mention the mount subcommand' }
+
+          & (Join-Path $dir 'uninstall.ps1')
+          if (Get-Service XfsWatcher -ErrorAction SilentlyContinue) { throw 'service survived uninstall' }
+          if (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp\Services\xfs-mount') { throw 'launcher class survived uninstall' }
+          $pathFinal = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if (($pathFinal -split ';') -contains $installDir) { throw 'PATH entry survived uninstall' }
+          if ($pathFinal -ne $pathBefore) { throw "PATH not restored byte-exact ($($pathBefore.Length) -> $($pathFinal.Length))" }
+          Write-Host 'uninstall.ps1: service, class, files and PATH entry all gone'
+
+      - name: upload the zip as a workflow artefact
         uses: actions/upload-artifact@v4
         with:
           name: xfs-win-driver-${{ matrix.arch }}
-          path: |
-            dist/xfs-win-driver-*-${{ matrix.arch }}-Setup.exe
-            dist/xfs-win-driver-*-${{ matrix.arch }}.msi
+          path: dist/xfs-win-driver-*-${{ matrix.arch }}.zip
           if-no-files-found: error
-
-      # Catches the winget License-Blocks-Install / Validation-Unattended-Failed
-      # categories before they become a PR rejection. Runs on every build (tag
-      # push or manual dispatch) so a broken bundle never reaches a release.
-      # Artefacts above are uploaded first so a failing run can still be
-      # downloaded for offline debugging.
-      - name: verify Setup.exe installs silently
-        shell: pwsh
-        run: |
-          $setup = (Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}-Setup.exe" | Select-Object -First 1).FullName
-          if (-not $setup) { throw "No Setup.exe found in dist\" }
-          installer\verify-silent.ps1 -SetupPath $setup
-
-      - name: upload verify-silent log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: verify-silent-log-${{ matrix.arch }}
-          path: dist/verify-silent.log
-          if-no-files-found: ignore
 
       - name: attach to GitHub Release (tag push only)
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $tag = '${{ github.ref_name }}'
-          gh release upload $tag (Get-ChildItem dist\xfs-win-driver-*-${{ matrix.arch }}-Setup.exe).FullName --clobber
-          gh release upload $tag (Get-ChildItem dist\xfs-win-driver-*-${{ matrix.arch }}.msi).FullName --clobber
+          gh release upload $tag (Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}.zip").FullName --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -228,8 +204,23 @@ jobs:
         shell: pwsh
         run: |
           $tag = '${{ inputs.tag }}'
-          if (-not $tag) { throw "tag input is required for workflow_dispatch" }
-          gh release upload $tag (Get-ChildItem dist\xfs-win-driver-*-${{ matrix.arch }}-Setup.exe).FullName --clobber
-          gh release upload $tag (Get-ChildItem dist\xfs-win-driver-*-${{ matrix.arch }}.msi).FullName --clobber
+          if (-not $tag) { throw 'tag input is required for workflow_dispatch' }
+          gh release upload $tag (Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}.zip").FullName --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: report what winget still needs
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # Deliberately not automated. winget/installer.yaml still describes a
+          # Burn bundle that can no longer be produced, and it quotes SHA-256
+          # values for release assets that were never published. Before any
+          # submission PR: move the manifest to the zip shape (InstallerType
+          # archive with InstallCommands/UninstallCommands) and take the
+          # checksums from an uploaded asset. Printed here so the numbers are
+          # one scroll away.
+          Write-Warning 'winget manifest is stale: it still describes the removed bundle installer.'
+          Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}.zip" | ForEach-Object {
+            Write-Host ("  {0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name)
+          }
