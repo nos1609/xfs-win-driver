@@ -22,8 +22,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0). Required when running manually.'
-        required: true
+        description: 'Release tag to upload the zip to (e.g. v0.1.0). Leave empty to build and verify the installer without publishing anything.'
+        required: false
         default: ''
 
 permissions:
@@ -200,11 +200,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: attach to GitHub Release (manual dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        # An empty tag skips this rather than failing it. The dispatch exists
+        # to answer "does the zip install", and that question is answered two
+        # steps earlier; throwing at the end burned fifteen minutes of build
+        # and left the run red for no finding.
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != ''
         shell: pwsh
         run: |
-          $tag = '${{ inputs.tag }}'
-          if (-not $tag) { throw 'tag input is required for workflow_dispatch' }
+          $tag = '${{ github.event.inputs.tag }}'
           gh release upload $tag (Get-ChildItem "dist\xfs-win-driver-*-${{ matrix.arch }}.zip").FullName --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

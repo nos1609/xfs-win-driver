@@ -24,6 +24,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    # The two above cannot reach a working branch, and this family now works
+    # on branches of forks while the org repos stay pull-only. Without a
+    # manual trigger the first build against the new pins would have to wait
+    # for a PR that is not planned yet.
 
 env:
   CARGO_TERM_COLOR: always

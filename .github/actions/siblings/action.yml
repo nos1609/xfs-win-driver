@@ -14,10 +14,16 @@ description: >
 # which is the duplication chores.yml exists to remove -- so the refs are read
 # OUT OF chores.yml here, and the single declaration still holds.
 #
-# Why `git init` + `fetch` rather than `git clone` + `checkout`: winfsp-rs is
-# pinned to a bare commit that no published branch contains, so a clone has no
-# such object and `--branch` cannot name it. Asking the server for the SHA
-# directly is what works.
+# Why `git init` + `fetch <ref>` rather than `git clone` + `checkout <ref>`:
+# a clone can only land on a SHA that some branch it fetched happens to
+# contain, and both fork pins here are reachable only through our own working
+# branches -- branches that exist to be rebased or deleted. Asking the server
+# for the object by name works whether or not a branch still carries it, so
+# the pin is the only thing standing between this checkout and a 404.
+#
+# Note `chore siblings` uses clone + checkout and does work today, for the
+# same reason the comment above gives: the pinned commits are currently branch
+# tips. This action is the stricter of the two, not a fix for a broken one.
 #
 # Why the URL is read too instead of being reconstructed from the repo name:
 # the family is not all in one org, and a wrong URL makes git prompt for

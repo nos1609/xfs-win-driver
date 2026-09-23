@@ -217,6 +217,30 @@ Describe 'nothing still points at the removed WiX stage' {
     }
 }
 
+Describe 'a manual run can verify the build without publishing' {
+    It 'skips the release upload when no tag was given' {
+        $workflows = Join-Path (Join-Path $PSScriptRoot '..' '..') '.github/workflows'
+        $text = [IO.File]::ReadAllText((Join-Path $workflows 'release.yml'))
+
+        # The tag input was `required: true` and the step threw when it came up
+        # empty. GitHub enforces that server-side, so the only way to run the
+        # build was to name a Release to overwrite: the install checks could not
+        # be exercised at all, and a dispatch that did get through failed after
+        # fifteen minutes of build with nothing found.
+        $text | Should -Not -Match 'required: true' -Because 'an empty tag must be a legal dispatch'
+        $text | Should -Not -Match 'tag input is required' -Because 'a tagless run should end green after verifying the zip'
+        $text | Should -Match "github\.event\.inputs\.tag != ''" -Because 'the upload step needs its own guard'
+    }
+
+    It 'CI can be started on a branch that is neither main nor a pull request' {
+        # The family works on fork branches while the org repos stay pull-only,
+        # so push-to-main and PR both fail to reach the change under test.
+        $workflows = Join-Path (Join-Path $PSScriptRoot '..' '..') '.github/workflows'
+        $text = [IO.File]::ReadAllText((Join-Path $workflows 'ci.yml'))
+        $text | Should -Match '(?m)^\s{2}workflow_dispatch:\s*$' -Because 'a branch run has to be startable without a tag'
+    }
+}
+
 Describe 'the WinFsp pin stays machine-readable' {
     It 'declares the four variables at column zero, as the updater expects' {
         $installer = Join-Path (Join-Path $PSScriptRoot '..' '..') 'installer'
