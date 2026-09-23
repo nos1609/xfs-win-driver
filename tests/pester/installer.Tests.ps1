@@ -244,4 +244,44 @@ Describe 'the sibling pins cargo needs are all declared' {
             $chores | Should -Match "(?m)^  ${key}_REF: \S+"
         }
     }
+
+    It 'resolves every REF against the URL it is paired with' {
+        # A pin that exists only in somebody's local object database is the
+        # worst kind: cargo fails in CI with a message about a remote that
+        # "does not have" the commit, and the URL and the ref are two
+        # different lines of the same file, so they drift independently.
+        # Checked against the remote rather than a local clone, because the
+        # remote is what CI is going to ask. Skipped without network or
+        # without git, which is the case on some dev boxes.
+        $repo = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
+        $chores = [IO.File]::ReadAllLines((Join-Path $repo 'chores.yml'))
+
+        $vars = @{}
+        foreach ($line in $chores) {
+            if ($line -match '^\s{2}([A-Z_]+_(?:URL|REF)):\s*(\S+)') { $vars[$Matches[1]] = $Matches[2] }
+        }
+
+        $git = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $git) { Set-ItResult -Skipped -Because 'git is not installed here'; return }
+        # An unreachable or private remote must skip this, not stall the run
+        # behind an authentication prompt.
+        $env:GIT_TERMINAL_PROMPT = '0'
+
+        foreach ($key in 'FS_CORE', 'FS_XFS', 'SKELETON', 'HARNESS', 'WINFSP_RS') {
+            $url = $vars["${key}_URL"]
+            $ref = $vars["${key}_REF"]
+            $listing = & $git ls-remote $url 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Set-ItResult -Skipped -Because "the remote $url was not reachable from this run"
+                return
+            }
+            # A tag or branch name appears as a ref; a bare commit hash
+            # appears as the object id of some ref. Both must be there.
+            $escaped = [regex]::Escape($ref)
+            $hit = @($listing | Where-Object {
+                $_ -match "(^|/)$escaped($|\s)" -or $_ -match "^\S+\s+$escaped\s"
+            })
+            $hit.Count | Should -BeGreaterThan 0 -Because "$key pins $ref, and $url must actually serve it"
+        }
+    }
 }

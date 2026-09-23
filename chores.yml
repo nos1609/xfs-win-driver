@@ -11,37 +11,49 @@ chore_min_version: 0.6.0
 # The argument for a submodule is that winfsp-rs is our fork of someone
 # else's crate, carrying a patch that is not ours to release, and that
 # no other repo wants that revision. The second half stopped being true:
-# both existing drivers now pin the SAME revision, because upstream
-# 0.13.0 does not compile for *-pc-windows-gnullvm. Once every consumer
-# wants one revision, a per-consumer pin is exactly the drift a sibling
-# checkout makes unrepresentable.
+# both existing drivers pinned the SAME revision, because upstream 0.13.0
+# does not compile for *-pc-windows-gnullvm.
 #
-# So this repo takes the simpler shape, and if it holds, the other two
-# should follow rather than this one being bent back to match them.
+# That symmetry has now broken deliberately, and the reason is access,
+# not taste: antimatter-studios grants this account `pull` and not `push`
+# on every repo in the family, so a fix that the driver needs in order to
+# work cannot be put where the org pins point. It goes to a fork under the
+# contributor and is referenced from there. Two consequences worth saying
+# out loud: the "every consumer builds the same winfsp-rs revision"
+# property no longer holds, and a fork is a place someone can delete -- if
+# that happens the pin below stops resolving, so the durable fix is still
+# a merged upstream change, not this file.
 #
-# The manifest already depends on `../winfsp-rs/winfsp`, so the sibling
-# layout is not a change here -- it is what this tree was written
-# against.
+# Repos we change are pinned to the fork. Repos we do not are left on the
+# org, because forking them would buy nothing and would make it less
+# obvious that no local edit is hiding there.
 
 vars:
   # URL beside ref for each: the family is not all in one org
   # (rust-fs-ext4 and rust-fs-ntfs live under christhomas/), and git
   # answers a repo it cannot see with a credential prompt rather than a
   # 404, so a reconstructed URL fails as an auth error.
-  FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
+  FS_CORE_URL: https://github.com/nos1609/rust-fs-core.git
   FS_CORE_REF: v0.2.4
-  FS_XFS_URL: https://github.com/antimatter-studios/rust-fs-xfs.git
+  # Pinned to a tag rather than a commit: no XFS-side change is in this
+  # ref yet. When one lands it moves to a branch head, and the bmap-tree
+  # descent bug (rust-fs-xfs#250) is the likely first reason for that.
+  FS_XFS_URL: https://github.com/nos1609/rust-fs-xfs.git
   FS_XFS_REF: v0.6.0
-  SKELETON_URL: https://github.com/antimatter-studios/winfsp-fs-skeleton.git
-  SKELETON_REF: v0.2.1
+  # Commit, not tag: v0.2.1 predates the startup disk enumeration and the
+  # read-only flag on the watcher's spawn, both of which the driver needs.
+  SKELETON_URL: https://github.com/nos1609/winfsp-fs-skeleton.git
+  SKELETON_REF: ad0314dbeaf03c0730694d2f8984e25f0687f6ea
   HARNESS_URL: https://github.com/antimatter-studios/fs-test-harness.git
   HARNESS_REF: v3.11.0
-  # Pinned to a commit, not a branch: this is the revision both other
-  # drivers build against. Upstream 0.13.0 declares the guard-strategy
-  # constant signed while bindgen emits it unsigned for the gnullvm
-  # target, so it does not compile there.
-  WINFSP_RS_URL: https://github.com/antimatter-studios/winfsp-rs.git
-  WINFSP_RS_REF: 59ab48bca2a67c95d4eba640343b6b80b87bb6ea
+  # Commit, not branch: the pinned ancestor carries the gnullvm
+  # guard-strategy fix (upstream 0.13.0 declares that constant signed
+  # while bindgen emits it unsigned there), and the child carries the
+  # directory-entry name fix without which every enumerated name comes
+  # back one WCHAR long.
+  WINFSP_RS_URL: https://github.com/nos1609/winfsp-rs.git
+  WINFSP_RS_REF: 6243135586d827671a16fc968ebd9ba39f6c37ba
+
 
 tasks:
   siblings:
