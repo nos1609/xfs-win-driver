@@ -1,191 +1,172 @@
 # xfs-win-driver installer
 
-WiX 7 source for the xfs-win-driver Windows installer. Two artefacts:
+Packaging and installation for the read-only XFS driver. One artefact: a zip
+holding `xfs.exe` and the scripts that register it.
 
-> **Upstream:** these wxs files are an xfs-customised copy of the
-> templates shipped in
-> [winfsp-fs-skeleton/templates/installer/](https://github.com/antimatter-studios/winfsp-fs-skeleton/tree/main/templates/installer).
-> Future filesystem drivers (qcow2 / ntfs / ...) start from the same
-> templates with their own product name + GUIDs substituted in. If
-> you fix a structural bug here, propagate it back to the skeleton's
-> templates so other consumers benefit.
+## What ships
 
-| File                                          | Audience                | What it does                                              |
-|-----------------------------------------------|-------------------------|-----------------------------------------------------------|
-| `xfs-win-driver-<ver>-<arch>-Setup.exe`      | **end users (default)** | Burn bootstrapper: installs WinFsp first, then the MSI.   |
-| `xfs-win-driver-<ver>-<arch>.msi`            | IT admins (SCCM/Intune) | Plain MSI; assumes WinFsp is already deployed separately. |
+`installer/package.ps1` produces `xfs-win-driver-<version>-<arch>.zip`:
 
-`<arch>` is `x64` or `arm64` — must match the `xfs.exe` you embed.
+| File | Purpose |
+|---|---|
+| `xfs.exe` | CLI, WinFsp file system and SCM watcher -- one binary, subcommand selects |
+| `install.ps1` | registers the service and the WinFsp launcher class |
+| `uninstall.ps1` | reverses it |
+| `Mount-Xfs.ps1` | ad-hoc mount of one image or partition, no service involved |
+| `winfsp-pin.ps1` | the WinFsp release this driver is tested against |
+| `README.md` | this file |
 
-Both ship `xfs.exe`, `Mount-Xfs.ps1`, an Explorer right-click "Mount as
-xfs" verb on `.img` files, and Start Menu shortcuts.
+## Prerequisite: WinFsp
 
-## Prerequisites
+WinFsp is not bundled. `install.ps1` refuses to run without it and quotes the
+pinned release, version and checksum from `winfsp-pin.ps1`. Refresh the pin
+with `installer/update-winfsp-pin.sh --apply`; it needs an authenticated `gh`
+and nothing else (it uses `gh --jq`, not the `jq` binary).
 
-1. **Rust** + the `mount` feature build chain (see top-level `README.md`).
-2. **WiX 4+ toolset:**
-   ```powershell
-   dotnet tool install --global wix
-   wix extension add WixToolset.Util.wixext
-   wix extension add WixToolset.BootstrapperApplications.wixext   # bundle UI (WiX 7+; was WixToolset.Bal.wixext in WiX 4)
-   ```
-   Or via winget: `winget install WiXToolset.WiX`.
-3. **Internet access on first build** — `build.ps1` downloads the WinFsp
-   redistributable MSI into `installer\redist\` and caches it. Subsequent
-   builds are offline.
+Install WinFsp from its own MSI first. The launcher service has to be running
+before a volume can be published, so reboot if its installer asks.
 
-## Build
+## Install
 
-From the repo root:
+As administrator, from the unpacked zip -- unpack the whole archive, the
+scripts look for `xfs.exe` beside them:
 
 ```powershell
-# 1. Build the binary with WinFsp support.
-cargo build --release --features mount
-
-# 2a. x64 host: build x64 MSI + Setup.exe (default).
-installer\build.ps1 -ExePath target\release\xfs.exe
-
-# 2b. arm64 host: build arm64 MSI + Setup.exe.
-installer\build.ps1 -ExePath target\release\xfs.exe -Arch arm64
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\install.ps1
 ```
 
-Outputs in `dist\`:
+It does four things, and three of them are Windows facts that were each paid
+for once:
 
-- `xfs-win-driver-<ver>-<arch>-Setup.exe` — ship this.
-- `xfs-win-driver-<ver>-<arch>.msi`        — admin channel only.
+1. **Files** into `%ProgramFiles%\xfs-win-driver`, and that directory onto the
+   system PATH (a new window is needed to see it -- no settings broadcast is
+   sent).
+2. **`XfsWatcher`** registered as LocalSystem with **Automatic (Delayed
+   Start)** plus restart-on-failure. Delayed rather than plain auto because the
+   watcher enumerates every disk and publishes volumes at startup; it belongs
+   after the boot-critical work, not inside it. The script reads the service
+   key back and fails if the delay did not land, because `Start=2` alone reads
+   as "Auto" everywhere and would hide a silent miss.
+3. **The `xfs-mount` launcher class** under
+   `HKLM\SOFTWARE\WOW6432Node\WinFsp\Services\xfs-mount` with
+   `mount %2 --drive %1 --part %3 --ro`.
+4. **Start**, then report what appeared.
 
-`build.ps1` parameters:
+Two details in step 3 are the whole game. `WOW6432Node` is not decoration:
+WinFsp.Launcher is a 32-bit service and reads classes from the 32-bit view, so
+a class written into the 64-bit view is invisible and the mount fails later
+with `c0000034` (OBJECT_NAME_NOT_FOUND). And `--ro` must live in this
+template, because argv for a service-driven mount is assembled from it --
+nothing in the driver's code ever sees that flag, so a template without it is a
+silently writable overlay on whatever partition the machine also boots from.
 
-| Param         | Default                                                      |
-|---------------|--------------------------------------------------------------|
-| `-ExePath`    | *(required)* — path to the release `xfs.exe`                |
-| `-Version`    | parsed from `Cargo.toml`                                     |
-| `-OutputDir`  | `<repo>\dist`                                                |
-| `-MsiOnly`    | switch — skip the bundle stage                               |
-| `-Arch`       | `x64` (default) or `arm64` — must match `xfs.exe`           |
+## Verify
 
-`-Arch` must match the embedded `xfs.exe`'s Rust target:
-
-| `-Arch` | Rust target                          | PE Machine |
-|---------|--------------------------------------|------------|
-| `x64`   | `x86_64-pc-windows-msvc`             | `0x8664`   |
-| `arm64` | `aarch64-pc-windows-gnullvm`         | `0xAA64`   |
-
-The script PE-sniffs `$ExePath` at startup and prints a warning if its
-`IMAGE_FILE_HEADER.Machine` doesn't agree with `-Arch`. The mismatched
-MSI still builds — Burn will install it cleanly — but the binary will
-not run on the host CPU.
-
-## Bumping the WinFsp pin
-
-```sh
-installer/update-winfsp-pin.sh           # check for drift (exit 1 if stale)
-installer/update-winfsp-pin.sh --apply   # rewrite build.ps1 in place
+```powershell
+& 'C:\Program Files (x86)\WinFsp\bin\launchctl-a64.exe' list   # -> xfs-mount E
+(Get-PSDrive -PSProvider FileSystem).Name                      # the new letter
+Get-Content <letter>:\etc\os-release -TotalCount 1             # plain, unprivileged
 ```
 
-The script queries the WinFsp GitHub releases via `gh`, picks the latest
-non-prerelease tag, finds the `winfsp-<ver>.msi` asset, reads its SHA256
-from the asset metadata, and updates the four `$WinFsp*` constants near
-the top of [`build.ps1`](build.ps1). Requires `gh` (authenticated) and
-`jq`.
+The volume must be visible to a normal non-elevated shell -- that is the point
+of going through the launcher instead of mounting inside the service's own
+session. A write attempt should come back "The media is write protected".
 
-`$WinFspVersion` feeds `Bundle.wxs`'s `DetectCondition` so end users
-already running a newer WinFsp don't get downgraded.
-
-## What the MSI does
-
-- Installs `xfs.exe`, `Mount-Xfs.ps1`, and `LICENSE.txt` into
-  `%ProgramFiles%\xfs-win-driver\`.
-- Appends the install dir to the **system** `PATH`.
-- Adds Explorer right-click "Mount as xfs" on `.img` files (via
-  `HKCR\SystemFileAssociations\.img\shell\MountAsXfs` — non-destructive;
-  the built-in Disk Management "Mount" verb keeps working for VHD/ISO).
-- Adds two Start Menu shortcuts under "xfs-win-driver":
-  - **Mount xfs image...** — file picker → `xfs mount`.
-  - **xfs watch service** — runs `xfs watch` in a console.
-- Cleans up everything on uninstall.
-
-## What the bundle does
-
-`Setup.exe` runs the WinFsp MSI first (skipped if a WinFsp ≥
-`$WinFspVersion` is already installed — detected via
-`HKLM\SOFTWARE\WOW6432Node\WinFsp\Version`), then chains the
-xfs-win-driver MSI. WinFsp is left in place on uninstall
-(`Permanent="yes"`) because other apps (sshfs-win, rclone, …) may rely
-on it.
+"Nothing mounted" is a legitimate outcome, not a failure: either no supported
+filesystem was found, or the XFS volume's log still needs replaying and the
+driver refuses to guess. Boot Linux normally rather than hibernating to clear
+the second case.
 
 ## Uninstall
 
-Standard "Apps & features" / Add-Remove-Programs entry, or:
-
 ```powershell
-# Bundle install:
-"%ProgramData%\Package Cache\{b6d4e8a1-3f29-4c7d-9e22-1a8c5d6f7e34}\xfs-win-driver-<ver>-Setup.exe" /uninstall
-
-# MSI-only install:
-msiexec /x dist\xfs-win-driver-<ver>.msi
+.\uninstall.ps1
 ```
 
-## Troubleshooting
+Stops and deletes `XfsWatcher`, removes the `xfs-mount` class, removes the
+installed files and drops the PATH entry -- rebuilding PATH from the existing
+entries minus ours, so anything added after us survives and no other entry is
+reordered. WinFsp is left alone: it may be serving sshfs-win, rclone or
+another driver from this family.
 
-### `wix extension list -g` reports `WixToolset.Bal.wixext 7.0.0 (damaged)`
-
-The Bal extension was renamed in WiX 7 to `WixToolset.BootstrapperApplications.wixext`.
-The old `WixToolset.Bal.wixext` package on NuGet is now an empty shim
-that always reports `(damaged)`. The fix is to install the **new** name
-instead:
-
-```powershell
-wix extension remove -g WixToolset.Bal.wixext            # may error; ignore
-Remove-Item -Recurse -Force "$env:USERPROFILE\.wix\extensions\WixToolset.Bal.wixext" -ErrorAction SilentlyContinue
-wix extension add -g WixToolset.BootstrapperApplications.wixext
-wix extension list -g                                     # should show "WixToolset.BootstrapperApplications.wixext 7.0.0" with no "(damaged)"
-```
-
-`build.ps1` already passes `-ext WixToolset.BootstrapperApplications.wixext`
-to the bundle stage, so once the extension is installed under the new
-name the build picks it up automatically.
-
-The `bal:` xmlns + element names in `Bundle.wxs` are unchanged — the
-schema namespace URL is the same; only the NuGet package + DLL name
-moved.
-
-### Generic `(damaged)` on any extension
-
-If a different WiX extension goes corrupt, the standard repair is:
+## Build
 
 ```powershell
-wix extension remove -g <name>
-Remove-Item -Recurse -Force "$env:USERPROFILE\.wix\extensions\<name>"
-wix extension add -g <name>
+installer\package.ps1 -Arch arm64            # cargo build, then pack
+installer\package.ps1 -Arch x64 -SkipBuild   # pack an already-built exe
 ```
 
-If global re-add still produces `(damaged)`, do a per-project install
-from inside `installer\`:
+`package.ps1` refuses to package a binary whose PE `Machine` field disagrees
+with `-Arch` (0xAA64 for arm64, 0x8664 for x64): a mislabelled artefact
+installs cleanly and then does not run, which is the worst kind of release bug
+to discover on somebody else's machine. It prints SHA-256 for the exe and the
+zip. `--target` in the cargo call is load-bearing, not cosmetics -- without it
+output lands in `target\release\` while packaging reads the arch directory, and
+the zip then quietly ships whatever the previous `--target` build left there.
+That has happened here.
 
-```powershell
-Push-Location installer
-wix extension add <name>      # no -g — drops a .wix folder next to the WXS sources
-Pop-Location
-```
+**Building on this machine is currently unreliable, and that is a host
+property, not a code one.** Smart App Control blocks loading
+`rustc_driver-*.dll` from the toolchain (Code Integrity events 3077, policy
+`{0283ac0f-fff1-49ae-ada1-8a933130cad6}`). The toolchain is unsigned
+(`Get-AuthenticodeSignature` says NotSigned for both `rustc.exe` and the driver
+DLL), the file has not changed since 2026-09-01, and it built fine one
+afternoon -- then the next morning `rustc -vV` printed nothing, because the
+reputation verdict for the same bytes flipped across a reboot. SAC is not being
+turned off for this. Practical shape of the pipeline: build in CI on a runner
+without SAC, use this machine to test the resulting zip, and `-SkipBuild` to
+package what is already there.
 
-`build.ps1` already runs `wix build` from `installer\` (`Push-Location
-$scriptDir`), so a per-project extension is picked up without code
-changes.
+## What the MSI did that this does not
 
-### `build.ps1` complains about a string literal / `'` mismatch
+The previous installer was WiX, and it also added an Explorer right-click
+"Mount as xfs" verb on `.img` files, two Start Menu shortcuts, `LICENSE.txt`,
+and upgrade detection against a stable `UpgradeCode`. None of that is here:
+the context menu and shortcuts are convenience, and the release is not at the
+point where inventing them by script beats saying which ones are missing. If
+they matter, they are registry writes under `HKCR\SystemFileAssociations\.img`
+and `\$\env:ProgramData\Microsoft\Windows\Start Menu\Programs`.
 
-PowerShell 5.1 reads `.ps1` files as Windows-1252 unless they have a
-UTF-8 BOM. The script contains em-dashes in comments, which mojibake
-without the BOM and turn into broken string literals. Save the file as
-UTF-8 with BOM (or use PowerShell 7+, which defaults to UTF-8).
+## Why there is no MSI here
 
-## Notes
+WiX v7 -- the version these installer sources were written for -- refuses to
+run at all until the Open Source Maintenance Fee EULA is accepted
+(`error WIX7015`). Under its own terms the fee does not apply to this use
+(section 1: only revenue-generating users at or above US\$10 000 gross annual
+revenue pay; below that they are exempt), so accepting costs nothing. But it is
+still a click every fork and every CI runner must make in order to produce an
+artefact whose source is under the Microsoft Reciprocal License, and section 4
+of the same agreement says the OSI licence governs any conflict and that
+self-compiling from source needs no agreement at all. That is a poor trade for
+a hobby driver.
 
-- The `UpgradeCode` GUIDs in `Product.wxs` and `Bundle.wxs` are **stable**
-  across versions — do not regenerate them.
-- The MSI is per-arch (`-Arch x64` or `-Arch arm64`). Build both arches
-  separately if you need to ship both — they install side-by-side via
-  the arch suffix in the artefact name.
-- `Mount-Xfs.ps1` is also usable stand-alone — copy it next to a dev
-  `xfs.exe` and run it.
+This is a toolchain decision, not an MSI limitation, and the distinction
+matters for anyone tempted to conclude MSI cannot do it:
+
+- Delayed auto start **is** expressible in MSI -- a row in the
+  `MsiServiceConfig` table (`ConfigType` =
+  `SERVICE_CONFIG_DELAYED_AUTO_START` (3), `Argument` = 1) applied by the
+  `MsiConfigureServices` standard action, sequenced after `InstallServices`
+  and before `StartServices`, valid only for a service installed with
+  `SERVICE_AUTO_START`
+  ([MsiServiceConfig Table](https://learn.microsoft.com/windows/win32/msi/msiserviceconfig-table),
+  [MsiConfigureServices Action](https://learn.microsoft.com/windows/win32/msi/msiconfigureservices-action)).
+  What cannot express it is `ServiceInstall/@Start`, which is the actual gap in
+  the old `Product.wxs`.
+- Microsoft documents MSI's sibling `MsiServiceConfigFailureActions` -- service
+  recovery actions -- as "not working as expected" and tells developers to run
+  `sc.exe` from a custom action. `install.ps1` runs `sc.exe` for both, so it is
+  not routing around a working feature.
+
+A real MSI remains available: WiX v3.14 is MS-RL with no fee gate, its own
+schema already carries `<ServiceConfig DelayedAutoStart>`, and `arm64` is a
+valid package architecture there. The cost is rewriting the sources from the v4
+namespace back to v3 and driving `candle`/`light` instead of `wix build`. That
+is a separate decision from shipping, which is why it is not done here.
+
+The shared templates in
+[`winfsp-fs-skeleton/templates/installer/`](https://github.com/antimatter-studios/winfsp-fs-skeleton/tree/main/templates/installer)
+still describe the WiX route, and ext4-win-driver and erofs-win-driver were cut
+from them. Moving the family off WiX is a family decision, not a
+single-repository one -- which is why those files are still there.

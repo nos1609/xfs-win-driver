@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Refresh the WinFsp pin in build.ps1 to the latest stable release.
+# Refresh the WinFsp pin in winfsp-pin.ps1 to the latest stable release.
 #
 # Queries github.com/winfsp/winfsp via `gh`, picks the newest non-prerelease
 # tag, finds the `winfsp-<ver>.msi` asset, reads its sha256 from the asset
 # digest field, and rewrites the four `$WinFsp*` constants near the top of
-# build.ps1.
+# winfsp-pin.ps1.
 #
 # Usage:
 #   installer/update-winfsp-pin.sh           # show drift, do not modify
-#   installer/update-winfsp-pin.sh --apply   # rewrite build.ps1 in place
+#   installer/update-winfsp-pin.sh --apply   # rewrite winfsp-pin.ps1 in place
 #
-# Requires: gh (authenticated), jq, sed, awk.
+# Requires: gh (authenticated), sed, awk.
 
 set -euo pipefail
 
@@ -22,11 +22,10 @@ case "${1:-}" in
 esac
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-build_ps1="$script_dir/build.ps1"
+pin_file="$script_dir/winfsp-pin.ps1"
 
-[ -f "$build_ps1" ] || { echo "build.ps1 not found at $build_ps1" >&2; exit 1; }
+[ -f "$pin_file" ] || { echo "winfsp-pin.ps1 not found at $pin_file" >&2; exit 1; }
 command -v gh >/dev/null || { echo "gh CLI not found in PATH" >&2; exit 1; }
-command -v jq >/dev/null || { echo "jq not found in PATH"      >&2; exit 1; }
 
 # --- Discover latest stable release ----------------------------------------
 tag=$(gh release list --repo winfsp/winfsp --exclude-pre-releases --limit 1 \
@@ -45,12 +44,12 @@ read -r name sha256 < <(
 # winfsp-2.1.25156.msi → 2.1.25156
 version=$(printf '%s' "$name" | sed -E 's/^winfsp-([0-9.]+)\.msi$/\1/')
 
-# Reconstructed URL — keeps $WinFspMsiName interpolation in build.ps1.
+# Reconstructed URL — keeps $WinFspMsiName interpolation in winfsp-pin.ps1.
 url_template="https://github.com/winfsp/winfsp/releases/download/$tag/\$WinFspMsiName"
 
-# --- Read current pin from build.ps1 ---------------------------------------
-cur_version=$(awk -F"'" '/^\$WinFspVersion[[:space:]]*=/ {print $2; exit}' "$build_ps1")
-cur_sha256=$( awk -F"'" '/^\$WinFspSha256[[:space:]]*=/  {print $2; exit}' "$build_ps1")
+# --- Read current pin from winfsp-pin.ps1 ---------------------------------------
+cur_version=$(awk -F"'" '/^\$WinFspVersion[[:space:]]*=/ {print $2; exit}' "$pin_file")
+cur_sha256=$( awk -F"'" '/^\$WinFspSha256[[:space:]]*=/  {print $2; exit}' "$pin_file")
 
 printf 'current pin: %s  sha256=%s\n' "${cur_version:-<unset>}" "${cur_sha256:-<unset>}"
 printf 'latest pin:  %s  sha256=%s  (%s)\n' "$version" "$sha256" "$tag"
@@ -61,11 +60,11 @@ if [ "$cur_version" = "$version" ] && [ "$cur_sha256" = "$sha256" ]; then
 fi
 
 if [ "$apply" -eq 0 ]; then
-    echo 'drift detected — re-run with --apply to rewrite build.ps1.'
+    echo 'drift detected — re-run with --apply to rewrite winfsp-pin.ps1.'
     exit 1
 fi
 
-# --- Rewrite build.ps1 in place --------------------------------------------
+# --- Rewrite winfsp-pin.ps1 in place --------------------------------------------
 # Use a portable sed — `sed -i` differs between BSD and GNU, so write to a
 # temp and move.
 tmp=$(mktemp)
@@ -76,7 +75,7 @@ sed -E \
     -e "s|^(\\\$WinFspMsiName[[:space:]]*=[[:space:]]*)'[^']*'|\\1'$name'|" \
     -e "s|^(\\\$WinFspUrl[[:space:]]*=[[:space:]]*)\"[^\"]*\"|\\1\"$url_template\"|" \
     -e "s|^(\\\$WinFspSha256[[:space:]]*=[[:space:]]*)'[^']*'|\\1'$sha256'|" \
-    "$build_ps1" > "$tmp"
+    "$pin_file" > "$tmp"
 
 # Sanity-check: all four lines must have changed exactly as expected.
 for var in WinFspVersion WinFspMsiName WinFspUrl WinFspSha256; do
@@ -86,10 +85,10 @@ for var in WinFspVersion WinFspMsiName WinFspUrl WinFspSha256; do
     fi
 done
 
-mv "$tmp" "$build_ps1"
+mv "$tmp" "$pin_file"
 trap - EXIT
 
-echo "build.ps1 updated:"
+echo "winfsp-pin.ps1 updated:"
 echo "  \$WinFspVersion = '$version'"
 echo "  \$WinFspMsiName = '$name'"
 echo "  \$WinFspUrl     = \"$url_template\""
