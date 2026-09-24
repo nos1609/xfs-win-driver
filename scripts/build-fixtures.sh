@@ -114,12 +114,20 @@ done
 # thousands of extents means the descent has to go down, back up, and across
 # sibling blocks the way a 1500-entry /usr/bin does on a live volume.
 #
-# Same wedge trick as above -- an append of one block followed by a file that
-# occupies the next one -- and each block starts with its own extent index,
-# so a read that returns the right LENGTH from the wrong EXTENT fails rather
-# than passing on a constant fill.
+# HOW NOT TO DO IT, learned the expensive way: interleave the writes with a
+# second file and flush every iteration. Two attempts, both "1 extents".
+# File data is delayed-allocated, so at writeback the allocator is asked for
+# "6000 blocks for this inode" as one job and hands back a contiguous run --
+# MAXEXTLEN is 2^21 blocks, so a single extent covering the whole file is
+# perfectly legal. Interleaving happens between inodes, not between blocks,
+# and wedges of one byte do not even occupy a block (XFS keeps a file that
+# small inside the inode).
+#
+# What is deterministic is a HOLE: an unmapped range cannot belong to any
+# extent, so writing every other block forces one extent per block written,
+# with no dependence on when the allocator decides to flush.
 mkdir -p "$MNT/dwedge"
-python3 - "$MNT/dwedge/blocks" <<'PY'
+python3 - "$OUT/deepblocks.tmp" <<'PY'
 import sys
 # 6000 blocks of 4096 bytes; the first 8 bytes of each are its index, LE.
 n = 6000
@@ -128,21 +136,15 @@ with open(sys.argv[1], "wb") as f:
         f.write(i.to_bytes(8, "little") + b"\0" * (4096 - 8))
 PY
 : > "$MNT/deepfile.bin"
-: > "$MNT/dwedge/gap.bin"
 for i in $(seq 0 5999); do
-    dd if="$MNT/dwedge/blocks" of="$MNT/deepfile.bin" bs=4096 count=1 \
-        skip="$i" oflag=append conv=notrunc status=none
-    # A WHOLE BLOCK, not a byte. Two earlier attempts produced one extent
-    # apiece: `printf 'w' > wedge` claims no block at all, because XFS keeps
-    # a file that small inside the inode, so nothing ever sat between
-    # deepfile's blocks to break the run -- and a per-iteration sync could not
-    # help when there was nothing to allocate. Growing one gap file by one
-    # block per iteration is the interleaving that forces it.
-    dd if=/dev/zero of="$MNT/dwedge/gap.bin" bs=4096 count=1 \
-        oflag=append conv=notrunc status=none
-    sync
+    dd if="$OUT/deepblocks.tmp" of="$MNT/deepfile.bin" bs=4096 count=1 \
+        skip="$i" seek="$((i * 2))" conv=notrunc status=none
 done
-rm -f "$MNT/dwedge/blocks"
+rm -f "$OUT/deepblocks.tmp"
+# The gap file the earlier attempts needed; nothing writes it any more, but a
+# stale one would occupy blocks the assertion counts on.
+rm -f "$MNT/dwedge/gap.bin" "$MNT/dwedge/blocks"
+rmdir "$MNT/dwedge" 2>/dev/null || true
 
 # Remember the inode number while the file is still mounted; the extent count
 # is read from the unmounted image below, because xfs_db against the backing

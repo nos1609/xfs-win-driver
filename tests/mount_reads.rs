@@ -200,15 +200,15 @@ fn a_btree_format_directory_lists_every_entry() {
     assert_eq!(got, want, "the listing should be exactly what was written");
 }
 
-/// /deepfile.bin is spread over thousands of one-block extents, so reaching
-/// any given byte means descending a bmap tree with intermediate levels --
-/// the depth nothing else here constructs, and the depth a 1500-entry
-/// directory on a live volume has.
+/// /deepfile.bin is spread over thousands of one-block extents separated by
+/// holes, so its data fork's bmap tree has intermediate levels -- the depth
+/// nothing else here constructs, and the depth a 1500-entry directory on a
+/// live volume has.
 ///
-/// The whole file is checked rather than sampled. Each 4096-byte block starts
-/// with its own index, so a walk that returns the right number of extents but
-/// lands one child off, or drops a subtree and re-reads another, fails on the
-/// first mismatching block and names it.
+/// Every 4096-byte block is checked, not sampled. A written block starts with
+/// its own extent index and a hole must read back as zeros, so a walk that
+/// lands one child off, skips a subtree, or maps an extent a block early all
+/// fail on the specific block they got wrong.
 #[test]
 fn a_deeply_fragmented_file_reads_back_extent_by_extent() {
     let Some(img) = fixture_or_skip() else { return };
@@ -218,7 +218,11 @@ fn a_deeply_fragmented_file_reads_back_extent_by_extent() {
         return;
     }
 
-    const BLOCKS: usize = 6000;
+    const EXTENTS: usize = 6000;
+    // Written blocks sit at every other position, so the file is twice as
+    // long as it has extents.
+    const BLOCKS: usize = EXTENTS * 2;
+
     let inode = fs
         .lookup_path("/deepfile.bin")
         .expect("find the fragmented file");
@@ -238,13 +242,21 @@ fn a_deeply_fragmented_file_reads_back_extent_by_extent() {
     let (blocks, tail) = all.as_chunks::<4096>();
     assert!(tail.is_empty(), "the file should be a whole number of blocks");
     for (index, block) in blocks.iter().enumerate() {
+        if index % 2 == 1 {
+            assert!(
+                block.iter().all(|&b| b == 0),
+                "block {index} is a hole and should read back as zeros"
+            );
+            continue;
+        }
         let mut key = [0u8; 8];
         key.copy_from_slice(&block[..8]);
         let stamp = u64::from_le_bytes(key);
         assert_eq!(
-            stamp, index as u64,
+            stamp,
+            (index / 2) as u64,
             "block {index} carries extent {stamp} -- the descent reached the wrong \
-             extent, or a whole subtree was skipped and re-read"
+             extent, or a whole subtree was skipped"
         );
     }
 }
