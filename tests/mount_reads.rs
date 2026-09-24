@@ -200,6 +200,55 @@ fn a_btree_format_directory_lists_every_entry() {
     assert_eq!(got, want, "the listing should be exactly what was written");
 }
 
+/// /deepfile.bin is spread over thousands of one-block extents, so reaching
+/// any given byte means descending a bmap tree with intermediate levels --
+/// the depth nothing else here constructs, and the depth a 1500-entry
+/// directory on a live volume has.
+///
+/// The whole file is checked rather than sampled. Each 4096-byte block starts
+/// with its own index, so a walk that returns the right number of extents but
+/// lands one child off, or drops a subtree and re-reads another, fails on the
+/// first mismatching block and names it.
+#[test]
+fn a_deeply_fragmented_file_reads_back_extent_by_extent() {
+    let Some(img) = fixture_or_skip() else { return };
+    let fs = mount(&img);
+    if !has_our_content(&fs) {
+        eprintln!("SKIPPED: fixture lacks the deliberate content; run scripts/build-fixtures.sh");
+        return;
+    }
+
+    const BLOCKS: usize = 6000;
+    let inode = fs
+        .lookup_path("/deepfile.bin")
+        .expect("find the fragmented file");
+    assert!(
+        matches!(inode.format, fs_xfs::inode::Format::Btree) && inode.nextents > 1000,
+        "/deepfile.bin has {} extents in {:?} format: the fixture is no longer \
+         fragmenting it, so this test would read an inline extent array and \
+         prove nothing about tree depth",
+        inode.nextents,
+        inode.format
+    );
+
+    let m = Mount::open(&img, None).expect("open");
+    let all = m.read_path("/deepfile.bin").expect("read the whole file");
+    assert_eq!(all.len(), BLOCKS * 4096, "every block should come back");
+
+    let (blocks, tail) = all.as_chunks::<4096>();
+    assert!(tail.is_empty(), "the file should be a whole number of blocks");
+    for (index, block) in blocks.iter().enumerate() {
+        let mut key = [0u8; 8];
+        key.copy_from_slice(&block[..8]);
+        let stamp = u64::from_le_bytes(key);
+        assert_eq!(
+            stamp, index as u64,
+            "block {index} carries extent {stamp} -- the descent reached the wrong \
+             extent, or a whole subtree was skipped and re-read"
+        );
+    }
+}
+
 /// A symlink's target is readable as stored, and a dangling one is a
 /// normal on-disk state rather than an error — resolving is the caller's
 /// business.

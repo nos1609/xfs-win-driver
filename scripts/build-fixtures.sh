@@ -105,6 +105,36 @@ for batch in $(seq 1 60); do
     printf 'w' > "$MNT/wedge-$batch"
 done
 
+# A file with thousands of one-block extents, so its bmap tree is several
+# levels deep rather than the root-plus-one-leaf shape /bmbtdir happens to
+# produce. Depth is the thing no case here reached until now, and it is the
+# thing that separates "the walk is right on this tree" from "the walk is
+# right on any tree": a 512-byte inode's root holds 23 pointers, so 24+
+# children means an intermediate level, and each leaf holds ~251 records, so
+# thousands of extents means the descent has to go down, back up, and across
+# sibling blocks the way a 1500-entry /usr/bin does on a live volume.
+#
+# Same wedge trick as above -- an append of one block followed by a file that
+# occupies the next one -- and each block starts with its own extent index,
+# so a read that returns the right LENGTH from the wrong EXTENT fails rather
+# than passing on a constant fill.
+mkdir -p "$MNT/dwedge"
+python3 - "$MNT/dwedge/blocks" <<'PY'
+import sys
+# 6000 blocks of 4096 bytes; the first 8 bytes of each are its index, LE.
+n = 6000
+with open(sys.argv[1], "wb") as f:
+    for i in range(n):
+        f.write(i.to_bytes(8, "little") + b"\0" * (4096 - 8))
+PY
+: > "$MNT/deepfile.bin"
+for i in $(seq 0 5999); do
+    dd if="$MNT/dwedge/blocks" of="$MNT/deepfile.bin" bs=4096 count=1 \
+        skip="$i" oflag=append conv=notrunc status=none
+    printf 'w' > "$MNT/dwedge/w-$i"
+done
+rm -f "$MNT/dwedge/blocks"
+
 # A symlink, and one that dangles: reading the target must work without
 # resolving it, and a dangling target is a normal thing on disk rather
 # than an error.
