@@ -132,8 +132,22 @@ for i in $(seq 0 5999); do
     dd if="$MNT/dwedge/blocks" of="$MNT/deepfile.bin" bs=4096 count=1 \
         skip="$i" oflag=append conv=notrunc status=none
     printf 'w' > "$MNT/dwedge/w-$i"
+    # The sync is what fragments it. Directory blocks are allocated when they
+    # are written, which is why the /bmbtdir wedges work without this; file
+    # data is delayed-allocated, so 6000 appends plus wedges came out as ONE
+    # 24 MB extent on the first run -- XFS_MAXEXTLEN is 2^21 blocks, so one
+    # extent covering the whole file is legal and the wedge never got a turn
+    # in between. Flushing every iteration forces block i's home to be chosen
+    # before the wedge exists.
+    sync
 done
 rm -f "$MNT/dwedge/blocks"
+
+# Remember the inode number while the file is still mounted; the extent count
+# is read from the unmounted image below, because xfs_db against the backing
+# file of a live mount reads whatever has reached disk, not the state the
+# kernel is holding.
+deep_ino=$(stat -c '%i' "$MNT/deepfile.bin")
 
 # A symlink, and one that dangles: reading the target must work without
 # resolving it, and a dangling target is a normal thing on disk rather
@@ -149,6 +163,21 @@ sync
 umount "$MNT"
 trap - EXIT
 rmdir "$MNT"
+
+# Fail HERE rather than in a test three steps later, and now off a clean
+# unmounted image. The extent count is the whole reason deepfile.bin exists;
+# if the allocator stops cooperating, the fixture says so where it is made,
+# with the number attached, instead of leaving a test to report that the
+# thing it means to exercise is not there.
+deep_extents=$(xfs_db -r -c "inode $deep_ino" -c print "$IMG" |
+    sed -n 's/^core.nextents *= *\([0-9][0-9]*\).*/\1/p' | head -1)
+echo "deepfile.bin: inode $deep_ino, ${deep_extents:-?} extents"
+[ "${deep_extents:-0}" -ge 5000 ] || {
+    echo "fixture did not fragment deepfile.bin (got '${deep_extents:-?}' extents, wanted >=5000);" >&2
+    echo "a file that is not fragmented cannot build a bmap tree with intermediate levels," >&2
+    echo "which is the only thing this case tests." >&2
+    exit 1
+}
 
 echo "built $IMG"
 ls -la "$IMG"
