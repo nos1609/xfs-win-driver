@@ -80,6 +80,31 @@ printf 'level one' > "$MNT/dir/one.txt"
 mkdir -p "$MNT/manyentries"
 for i in $(seq 1 200); do printf 'e%s' "$i" > "$MNT/manyentries/entry-$i.txt"; done
 
+# A directory whose EXTENT LIST no longer fits inside the inode, so XFS
+# moves its data fork into a bmap B+tree. This is the case the live volume
+# hits and the case nothing here covered until now: with a 512-byte inode
+# the fork holds 23 inline extent records, and past that the reader stops
+# parsing an array and starts walking a tree (bmbt::walk).
+#
+# Entries alone do not produce it. XFS extends a directory with adjacent
+# blocks, so a 7000-entry directory is routinely ONE extent and the tree
+# is never built -- a fixture that merely grows the directory would claim
+# to cover bmbt while testing the inline path again. The wedges are what
+# force it: a one-block file written after each batch sits between this
+# batch's directory block and the next one, so each extension has to be
+# allocated somewhere else and becomes its own extent.
+#
+# tests/mount_reads.rs asserts the fork really is in btree format, so if
+# XFS ever stops fragmenting this way the test fails instead of quietly
+# reverting to coverage we already had.
+mkdir -p "$MNT/bmbtdir"
+for batch in $(seq 1 60); do
+    for j in $(seq 1 120); do
+        printf '%s-%s' "$batch" "$j" > "$MNT/bmbtdir/f-$batch-$j"
+    done
+    printf 'w' > "$MNT/wedge-$batch"
+done
+
 # A symlink, and one that dangles: reading the target must work without
 # resolving it, and a dangling target is a normal thing on disk rather
 # than an error.

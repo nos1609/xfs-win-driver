@@ -155,6 +155,51 @@ fn a_large_directory_lists_every_entry() {
     }
 }
 
+/// The shape the live volume has and this fixture set did not: a directory
+/// with more extents than the inode can hold inline, so its data fork is a
+/// bmap B+tree and reading it goes through `bmbt::walk` rather than through
+/// the inline record array.
+///
+/// The format assertion is half the test. Without it, a fixture that
+/// stopped fragmenting would leave this green while quietly re-testing the
+/// inline path the previous test already covers.
+#[test]
+fn a_btree_format_directory_lists_every_entry() {
+    let Some(img) = fixture_or_skip() else { return };
+    let fs = mount(&img);
+    if !has_our_content(&fs) {
+        eprintln!("SKIPPED: fixture lacks the deliberate content; run scripts/build-fixtures.sh");
+        return;
+    }
+
+    let inode = fs
+        .lookup_path("/bmbtdir")
+        .expect("find the directory");
+    assert!(
+        matches!(inode.format, fs_xfs::inode::Format::Btree),
+        "/bmbtdir is in {:?} format, so the fixture no longer produces more extents \
+         than fit inline and this test would prove nothing about bmbt::walk",
+        inode.format
+    );
+
+    let dir = fs.open("/bmbtdir").expect("open the btree-format directory");
+    let mut got: Vec<String> = dir
+        .entries()
+        .expect("list it -- this walk reads a real two-level bmap tree")
+        .into_iter()
+        .filter(|e| e.name != b"." && e.name != b"..")
+        .map(|e| String::from_utf8_lossy(&e.name).to_string())
+        .collect();
+    got.sort();
+
+    let mut want: Vec<String> = (1..=60)
+        .flat_map(|b| (1..=120).map(move |j| format!("f-{b}-{j}")))
+        .collect();
+    want.sort();
+
+    assert_eq!(got, want, "the listing should be exactly what was written");
+}
+
 /// A symlink's target is readable as stored, and a dangling one is a
 /// normal on-disk state rather than an error — resolving is the caller's
 /// business.
