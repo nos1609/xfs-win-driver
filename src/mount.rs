@@ -145,6 +145,46 @@ pub fn metadata_cache(
     ))
 }
 
+/// Diagnostic switch: put no cache in front of the partition view.
+pub const NO_CACHE_ENV: &str = "XFS_NO_CACHE";
+
+/// The device handed to `Filesystem::mount` -- cached, or not.
+///
+/// `XFS_NO_CACHE` exists to answer a question that cannot be asked from
+/// inside the cache. When a read reports another block's contents, two
+/// explanations fit: the cache served a hit it should not have, or the
+/// address reaching the device was already wrong. They are told apart
+/// only by taking the cache out of the path and reading the same volume,
+/// which needs a build, which here needs CI.
+///
+/// Deliberately not a `--help` entry. A mount made this way is not
+/// representative of anything, so it is a lever for that investigation
+/// rather than a tuning knob -- and the warning at open time is what
+/// keeps someone from benchmarking an accident.
+///
+/// Any value counts as "off" except the empty string and `0`, so
+/// `XFS_NO_CACHE=1`, `XFS_NO_CACHE=yes` and a bare presence all behave
+/// the same way.
+pub fn mount_backend(
+    dev: Arc<dyn fs_core::BlockDevice>,
+    image: &Path,
+) -> Result<Arc<dyn fs_core::BlockRead>> {
+    let off = match std::env::var(NO_CACHE_ENV) {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    };
+    if off {
+        eprintln!(
+            "warning: {NO_CACHE_ENV} is set, so {} is mounted with no metadata cache -- \
+             enumeration timing measured here means nothing",
+            image.display()
+        );
+        let uncached: Arc<dyn fs_core::BlockRead> = dev;
+        return Ok(uncached);
+    }
+    Ok(metadata_cache(dev, image)?)
+}
+
 /// What to do with the in-memory read-write overlay when the user
 /// presses Ctrl-C / dismounts. XFS is read-only at the format level,
 /// so any writes the user made through the WinFsp surface are
@@ -243,8 +283,8 @@ impl Mount {
         let src: Arc<dyn BlockSource> = Arc::new(FileSource::open(image)?);
         let len = src.size();
         let dev = Arc::new(PartitionDevice { src, base: 0, len });
-        let cached = metadata_cache(dev as Arc<dyn fs_core::BlockDevice>, image)?;
-        let fs = Filesystem::mount(cached).map_err(|e| {
+        let backend = mount_backend(dev as Arc<dyn fs_core::BlockDevice>, image)?;
+        let fs = Filesystem::mount(backend).map_err(|e| {
             anyhow!(
                 "open XFS at {}: {e}{}",
                 image.display(),
@@ -286,8 +326,8 @@ impl Mount {
             );
         }
         let dev = Arc::new(PartitionDevice { src, base, len });
-        let cached = metadata_cache(dev as Arc<dyn fs_core::BlockDevice>, image)?;
-        let fs = Filesystem::mount(cached).map_err(|e| {
+        let backend = mount_backend(dev as Arc<dyn fs_core::BlockDevice>, image)?;
+        let fs = Filesystem::mount(backend).map_err(|e| {
             anyhow!(
                 "open XFS at {} partition {n} ({}): {e}",
                 image.display(),
