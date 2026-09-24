@@ -123,9 +123,15 @@ done
 # and wedges of one byte do not even occupy a block (XFS keeps a file that
 # small inside the inode).
 #
-# What is deterministic is a HOLE: an unmapped range cannot belong to any
-# extent, so writing every other block forces one extent per block written,
-# with no dependence on when the allocator decides to flush.
+# What does work is a gap between successive blocks -- two extents can only
+# merge if they are adjacent in the file, so writing every other block breaks
+# the run however the allocator schedules its flushes. One detail came out
+# differently than expected: XFS turns those gaps into ALLOCATED-UNWRITTEN
+# extents rather than leaving them unmapped, so the observed count was 11988
+# extents across 11999 blocks instead of 6000. The holes still read back as
+# zeros -- the test asserts exactly that -- and the number that matters is the
+# one the guard below checks, because at ~12k extents the tree cannot be a
+# root and a single leaf.
 mkdir -p "$MNT/dwedge"
 python3 - "$OUT/deepblocks.tmp" <<'PY'
 import sys

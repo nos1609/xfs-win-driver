@@ -218,10 +218,13 @@ fn a_deeply_fragmented_file_reads_back_extent_by_extent() {
         return;
     }
 
-    const EXTENTS: usize = 6000;
-    // Written blocks sit at every other position, so the file is twice as
-    // long as it has extents.
-    const BLOCKS: usize = EXTENTS * 2;
+    const WRITTEN: usize = 6000;
+    // Written blocks sit at every other position, so the file runs from block
+    // 0 to block 2*(WRITTEN-1) inclusive -- WRITTEN*2 minus one, because the
+    // last hole is past the end and nothing was written to extend it. The
+    // first cut of this constant claimed one block too many and the reader
+    // answered with the correct 11999, so this line is the fix, not the bug.
+    const BLOCKS: usize = WRITTEN * 2 - 1;
 
     let inode = fs
         .lookup_path("/deepfile.bin")
