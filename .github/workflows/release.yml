@@ -117,18 +117,11 @@ jobs:
           "Built $exe ($((Get-Item $exe).Length) bytes)"
 
       - name: check the installer scripts (Pester)
-        shell: pwsh
-        run: |
-          # Cheap, and the only thing standing between "someone edited
-          # install.ps1" and a released zip that installs a broken service.
-          # These are the same specs a contributor runs locally.
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.6
-          Import-Module Pester
-          $c = New-PesterConfiguration
-          $c.Run.Path = 'tests/pester'
-          $c.Output.Verbosity = 'Detailed'
-          $c.Fail.OnFailure = $true
-          Invoke-Pester -Configuration $c
+        # Cheap, and the only thing standing between "someone edited
+        # install.ps1" and a released zip that installs a broken service.
+        # Runs before packaging, so a broken script never reaches a zip that
+        # the next step would otherwise go on to install on this runner.
+        uses: ./.github/actions/pester
 
       - name: package the release zip
         shell: pwsh

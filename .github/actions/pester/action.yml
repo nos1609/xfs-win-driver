@@ -1,0 +1,35 @@
+name: run the installer script specs
+description: >
+  Install Pester and run tests/pester, failing the step if any spec fails.
+
+# Why this is its own action rather than a step in each workflow: the two
+# copies drifted, and the release copy died before running a single spec --
+# `$c.Fail.OnFailure` is not a property in the Pester that a runner installs,
+# so setting it throws InvalidOperation. The invocation is also the one piece
+# of the gate a contributor runs differently from CI, which is the wrong way
+# for a gate to work: tests/pester/run.ps1 and these workflows now ask the
+# same questions of the same files.
+#
+# Why the version is printed: the failure above depended on which Pester
+# `Install-Module` happened to resolve, and a gate whose behaviour changes with
+# its own tool version is only debuggable if the version is in the log.
+#
+# Why PassThru plus an explicit throw instead of `$c.Run.Exit`: same shape as
+# run.ps1, so a local run and a runner run report identically.
+
+inputs: {}
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: |
+        Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.6
+        Import-Module Pester
+        "Pester $((Get-Module Pester).Version)"
+        $c = New-PesterConfiguration
+        $c.Run.Path = Join-Path $env:GITHUB_WORKSPACE 'tests/pester'
+        $c.Run.PassThru = $true
+        $c.Output.Verbosity = 'Detailed'
+        $r = Invoke-Pester -Configuration $c
+        if ($r.FailedCount -ne 0) { throw "$($r.FailedCount) Pester tests failed" }
+        if ($r.PassedCount -eq 0) { throw 'no Pester test ran -- the suite is silently not executing' }

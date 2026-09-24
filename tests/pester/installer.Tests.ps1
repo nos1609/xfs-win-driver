@@ -215,6 +215,27 @@ Describe 'nothing still points at the removed WiX stage' {
         $rel | Should -Match '\./\.github/actions/siblings'
         ($ci + $rel) | Should -Not -Match 'pin\(\) \{ sed' -Because 'the composite action owns that logic now'
     }
+
+    It 'both Windows workflows share one Pester invocation' {
+        # The two copies had already drifted: the release one set
+        # `$c.Fail.OnFailure`, which is not a property of the Pester a runner
+        # installs, so the step threw InvalidOperation without running a spec.
+        # Nothing in the suite could notice, because the drift was in the
+        # invocation rather than in a file the suite reads.
+        $workflows = Join-Path (Join-Path $PSScriptRoot '..' '..') '.github/workflows'
+        foreach ($name in 'ci.yml', 'release.yml') {
+            $text = [IO.File]::ReadAllText((Join-Path $workflows $name))
+            $text | Should -Match '\./\.github/actions/pester' -Because "$name should not restate how the gate runs"
+            $text | Should -Not -Match 'Install-Module Pester' -Because 'the action owns installation'
+        }
+        $actionPath = Join-Path (Join-Path $workflows '..') 'actions/pester/action.yml'
+        # Comments are allowed to name the bug they explain, so only the
+        # executable lines are scanned -- the same rule the WiX spec uses.
+        $action = ([IO.File]::ReadAllLines($actionPath) |
+            Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+        $action | Should -Not -Match 'Fail\.OnFailure' -Because 'it is not a PesterConfiguration property and fails the step at assignment'
+        $action | Should -Match 'FailedCount' -Because 'a passing step must mean a passing suite'
+    }
 }
 
 Describe 'a manual run can verify the build without publishing' {

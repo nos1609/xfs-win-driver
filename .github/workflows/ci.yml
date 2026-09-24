@@ -198,17 +198,8 @@ jobs:
         uses: ./.github/actions/siblings
       - name: installer script specs (Pester)
         # The release workflow runs these too; running them here means a
-        # change to install.ps1 fails the PR rather than the next v* tag.
-        shell: pwsh
-        run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.6
-          Import-Module Pester
-          $c = New-PesterConfiguration
-          $c.Run.Path = 'tests/pester'
-          $c.Run.PassThru = $true
-          $c.Output.Verbosity = 'Detailed'
-          $r = Invoke-Pester -Configuration $c
-          if ($r.FailedCount -ne 0) { throw "$($r.FailedCount) Pester tests failed" }
+        # change to install.ps1 fails the branch rather than the next v* tag.
+        uses: ./.github/actions/pester
 
       - name: install Rust + gnullvm target
         shell: pwsh
