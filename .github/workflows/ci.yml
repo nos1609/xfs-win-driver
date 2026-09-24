@@ -148,6 +148,22 @@ jobs:
       - name: Build the fixture
         run: sudo scripts/build-fixtures.sh .fixtures
 
+      # The image itself, so the same bytes can be read twice on Windows: once
+      # through `mount`, which puts the metadata cache in front of the device,
+      # and once through `ls`, which does not. That difference is the cheapest
+      # way to attribute a wrong read, and it works on a binary that already
+      # runs here -- an unsigned CI build does not.
+      #
+      # Uploaded before the tests run on purpose: a fixture whose tests fail is
+      # the one most worth having.
+      - name: publish the fixture image
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-xfs-content
+          path: .fixtures/xfs-content.img
+          retention-days: 1
+          if-no-files-found: error
+
       - uses: actions/cache@v4
         with:
           path: |
