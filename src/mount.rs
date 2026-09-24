@@ -377,13 +377,25 @@ impl Mount {
     /// callers that already hold an `Inode` (the WinFsp context caches
     /// one) and so have nothing left to open from.
     fn read_whole(&self, inode: &Inode) -> std::result::Result<Vec<u8>, &'static str> {
+        // The returned string is a CLASS: callers map it to an NTSTATUS, and
+        // "not found" versus "device error" is a distinction the surface
+        // needs. The source error is not part of that mapping, so it used to
+        // be dropped by `|_|` here and a failed read was left with no reason
+        // anywhere -- which cost an afternoon when a fixture started failing
+        // with nothing but "underlay read error". Print it, classify it.
         let (inode, raw) = self
             .fs
             .read_inode_raw(inode.ino)
-            .map_err(|_| "underlay read error")?;
+            .map_err(|e| {
+                eprintln!("read of inode {} failed: {e}", inode.ino);
+                "underlay read error"
+            })?;
         self.fs
             .read_file(&inode, &raw)
-            .map_err(|_| "underlay read error")
+            .map_err(|e| {
+                eprintln!("read of inode {} contents failed: {e}", inode.ino);
+                "underlay read error"
+            })
     }
 
     pub fn read_path(&self, unix_path: &str) -> std::result::Result<Vec<u8>, &'static str> {
