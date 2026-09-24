@@ -1057,36 +1057,46 @@ mod winfsp_adapter {
         /// directory blocks and then one inode per child -- so callers
         /// must not run it once per output buffer. See
         /// [`XfsFileContext::dir_listing`].
-        fn build_merged_listing(&self, context: &XfsFileContext) -> Vec<MergedEntry> {
+        ///
+        /// Failures propagate. Both reads below used to be `if let Ok(..)`,
+        /// which turned a disk error into a directory that looks empty and
+        /// a single unreadable child into a directory that looks shorter
+        /// than it is -- and a truncated listing is indistinguishable from
+        /// a complete one to every caller, because "end of enumeration" is
+        /// how a listing ends either way. `usr\bin` on a live volume read
+        /// back as 0 entries for exactly that reason. Returning the error
+        /// costs a directory the caller cannot use and buys the one thing
+        /// a partial listing never gives: a reason.
+        fn build_merged_listing(
+            &self,
+            context: &XfsFileContext,
+        ) -> FspResult<Vec<MergedEntry>> {
             // 1. Build the underlay child set.
             let underlay_inode = context.inode.lock().unwrap().clone();
             let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
             if let Some(inode) = underlay_inode.as_ref() {
-                if let Ok(children) = read_children(self.fs(), inode) {
-                    for e in children {
-                        if e.name == b"." || e.name == b".." {
-                            continue;
-                        }
-                        let name = match std::str::from_utf8(&e.name) {
-                            Ok(s) => s.to_string(),
-                            Err(_) => continue,
-                        };
-                        let child_path = if context.unix_path == "/" {
-                            format!("/{name}")
-                        } else {
-                            format!("{}/{}", context.unix_path, name)
-                        };
-                        // Tombstoned: skip.
-                        if matches!(
-                            self.mount.overlay.lookup(&child_path),
-                            OverlayLookup::Deleted
-                        ) {
-                            continue;
-                        }
-                        if let Ok(child) = self.fs().read_inode(e.ino) {
-                            underlay_pairs.push((name, child));
-                        }
+                for e in read_children(self.fs(), inode)? {
+                    if e.name == b"." || e.name == b".." {
+                        continue;
                     }
+                    let name = match std::str::from_utf8(&e.name) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => continue,
+                    };
+                    let child_path = if context.unix_path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{}/{}", context.unix_path, name)
+                    };
+                    // Tombstoned: skip.
+                    if matches!(
+                        self.mount.overlay.lookup(&child_path),
+                        OverlayLookup::Deleted
+                    ) {
+                        continue;
+                    }
+                    let child = self.fs().read_inode(e.ino).map_err(err_to_status)?;
+                    underlay_pairs.push((name, child));
                 }
             }
 
@@ -1116,7 +1126,7 @@ mod winfsp_adapter {
                 all.push(MergedEntry::Overlay(name, entry));
             }
             all.sort_by(|a, b| a.name().cmp(b.name()));
-            all
+            Ok(all)
         }
 
         /// `true` if the volume must reject write callbacks. On a
@@ -1387,7 +1397,7 @@ mod winfsp_adapter {
                 match cached {
                     Some(existing) => existing,
                     None => {
-                        let fresh = Arc::new(self.build_merged_listing(context));
+                        let fresh = Arc::new(self.build_merged_listing(context)?);
                         if read_only {
                             *slot = Some(fresh.clone());
                         }
