@@ -128,17 +128,18 @@ with open(sys.argv[1], "wb") as f:
         f.write(i.to_bytes(8, "little") + b"\0" * (4096 - 8))
 PY
 : > "$MNT/deepfile.bin"
+: > "$MNT/dwedge/gap.bin"
 for i in $(seq 0 5999); do
     dd if="$MNT/dwedge/blocks" of="$MNT/deepfile.bin" bs=4096 count=1 \
         skip="$i" oflag=append conv=notrunc status=none
-    printf 'w' > "$MNT/dwedge/w-$i"
-    # The sync is what fragments it. Directory blocks are allocated when they
-    # are written, which is why the /bmbtdir wedges work without this; file
-    # data is delayed-allocated, so 6000 appends plus wedges came out as ONE
-    # 24 MB extent on the first run -- XFS_MAXEXTLEN is 2^21 blocks, so one
-    # extent covering the whole file is legal and the wedge never got a turn
-    # in between. Flushing every iteration forces block i's home to be chosen
-    # before the wedge exists.
+    # A WHOLE BLOCK, not a byte. Two earlier attempts produced one extent
+    # apiece: `printf 'w' > wedge` claims no block at all, because XFS keeps
+    # a file that small inside the inode, so nothing ever sat between
+    # deepfile's blocks to break the run -- and a per-iteration sync could not
+    # help when there was nothing to allocate. Growing one gap file by one
+    # block per iteration is the interleaving that forces it.
+    dd if=/dev/zero of="$MNT/dwedge/gap.bin" bs=4096 count=1 \
+        oflag=append conv=notrunc status=none
     sync
 done
 rm -f "$MNT/dwedge/blocks"
@@ -169,13 +170,22 @@ rmdir "$MNT"
 # if the allocator stops cooperating, the fixture says so where it is made,
 # with the number attached, instead of leaving a test to report that the
 # thing it means to exercise is not there.
-deep_extents=$(xfs_db -r -c "inode $deep_ino" -c print "$IMG" |
-    sed -n 's/^core.nextents *= *\([0-9][0-9]*\).*/\1/p' | head -1)
-echo "deepfile.bin: inode $deep_ino, ${deep_extents:-?} extents"
+# `head -1` here would kill the build: with pipefail, head closing the pipe
+# early leaves xfs_db dead of SIGPIPE, the substitution returns non-zero, and
+# `set -e` aborts on the line that only meant to ask a question. Take the
+# whole print into a variable instead and let the guard report what it found.
+deep_db=$(xfs_db -r -c "inode $deep_ino" -c print "$IMG" 2>/dev/null || true)
+deep_extents=$(printf '%s\n' "$deep_db" |
+    sed -n 's/^core\.nextents *= *\([0-9][0-9]*\).*/\1/p' | tail -1)
+echo "deepfile.bin: inode $deep_ino, ${deep_extents:-unreadable} extents"
 [ "${deep_extents:-0}" -ge 5000 ] || {
-    echo "fixture did not fragment deepfile.bin (got '${deep_extents:-?}' extents, wanted >=5000);" >&2
+    echo "fixture did not fragment deepfile.bin (got '${deep_extents:-unreadable}' extents, wanted >=5000);" >&2
     echo "a file that is not fragmented cannot build a bmap tree with intermediate levels," >&2
     echo "which is the only thing this case tests." >&2
+    if [ -z "$deep_extents" ]; then
+        echo "xfs_db printed no core.nextents; the field name or the image path is wrong." >&2
+        printf '%s\n' "$deep_db" | head -20 >&2
+    fi
     exit 1
 }
 
